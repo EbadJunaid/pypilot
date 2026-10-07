@@ -38,7 +38,7 @@ use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{MetadataSource, PyPiClient};
 use crate::settings::{Notifications, PackageManager, ResolvedMode, Settings};
 
-use diagnostics::{CMD_INSTALL, CMD_RECREATE};
+use diagnostics::{Scope, CMD_INSTALL, CMD_RECREATE};
 
 // F5 commands.
 const CMD_FIX: &str = "pypilot.fixEverything";
@@ -83,6 +83,10 @@ struct Shared {
     /// Edit counter per buffer. A debounced run compares against this and exits
     /// if the buffer moved on, which is the whole cancellation mechanism.
     revisions: Mutex<HashMap<Url, u64>>,
+    /// Diagnostics last published per URI. A code action request only carries
+    /// what is selected, and a notebook selection never spans cells, so the
+    /// whole-file and whole-notebook actions are built from this instead.
+    published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
     source: PyPiClient,
 }
 
@@ -204,6 +208,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         self.shared.documents.lock().await.remove(&uri);
         self.shared.revisions.lock().await.remove(&uri);
+        self.shared.published.lock().await.remove(&uri);
         // Clear our squiggles so they do not outlive the buffer.
         self.shared
             .client
@@ -212,7 +217,24 @@ impl LanguageServer for Backend {
     }
 
     async fn code_action(&self, params: CodeActionParams) -> RpcResult<Option<CodeActionResponse>> {
-        let actions = diagnostics::code_actions(&params.context.diagnostics);
+        let uri = &params.text_document.uri;
+        let (whole, scope) = {
+            let published = self.shared.published.lock().await;
+            match notebook_url(uri) {
+                // Every open cell of the same notebook, in a stable order.
+                Some(notebook) => {
+                    let mut cells: Vec<(&Url, &Vec<Diagnostic>)> = published
+                        .iter()
+                        .filter(|(cell, _)| notebook_url(cell).as_ref() == Some(&notebook))
+                        .collect();
+                    cells.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+                    let all = cells.into_iter().flat_map(|(_, d)| d.clone()).collect();
+                    (all, Scope::Notebook)
+                }
+                None => (published.get(uri).cloned().unwrap_or_default(), Scope::File),
+            }
+        };
+        let actions = diagnostics::code_actions_in(&params.context.diagnostics, &whole, scope);
         if actions.is_empty() {
             Ok(None)
         } else {
@@ -246,21 +268,23 @@ impl LanguageServer for Backend {
             }
             CMD_IGNORE => None,
 
+            // `[package, ...]`: one or more names, installed together.
             CMD_INSTALL => {
-                let Some(package) = string_arg(&params.arguments, 0) else {
+                let Some(packages) = string_args(&params.arguments, 0) else {
                     return Ok(None);
                 };
-                Some(run_install(self.shared.clone(), &root, &package).await)
+                Some(run_install(self.shared.clone(), &root, &packages).await)
             }
 
+            // `[python, package, ...]`: one rebuild, then every package.
             CMD_RECREATE => {
-                let (Some(python), Some(package)) = (
+                let (Some(python), Some(packages)) = (
                     string_arg(&params.arguments, 0),
-                    string_arg(&params.arguments, 1),
+                    string_args(&params.arguments, 1),
                 ) else {
                     return Ok(None);
                 };
-                Some(run_recreate(self.shared.clone(), &root, &python, &package).await)
+                Some(run_recreate(self.shared.clone(), &root, &python, &packages).await)
             }
 
             CMD_INSTALL_UV | "pypilot.installUv" => Some(run_install_uv(client).await),
@@ -340,6 +364,18 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
     findings.extend(guardian::check_attributes(&text, &venv, &installed));
 
     let published: Vec<Diagnostic> = findings.iter().map(diagnostics::to_diagnostic).collect();
+    {
+        // Closed while the analysis ran: storing would leak the entry and
+        // publishing would bring back squiggles did_close just cleared.
+        if !shared.documents.lock().await.contains_key(&uri) {
+            return;
+        }
+        shared
+            .published
+            .lock()
+            .await
+            .insert(uri.clone(), published.clone());
+    }
     shared
         .client
         .publish_diagnostics(uri, published, None)
@@ -375,25 +411,36 @@ fn venv_python(venv: &Path) -> Option<PyVersion> {
     crate::core::probe::parse_pyvenv_version(&text)
 }
 
-/// Returns whether the package ended up installed.
-async fn run_install(shared: Arc<Shared>, root: &Path, package: &str) -> bool {
-    let client = &shared.client;
-    if install::validate_package_name(package).is_err() {
-        client
-            .show_message(
-                MessageType::ERROR,
-                format!("PyPilot: `{package}` is not a valid package name."),
-            )
-            .await;
-        return false;
+/// Validate the requested names, telling the user which one was refused.
+async fn checked_packages(client: &Client, packages: &[String]) -> Option<Vec<String>> {
+    match install::validate_package_names(packages) {
+        Ok(packages) => Some(packages),
+        Err(bad) => {
+            client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("PyPilot: `{bad}` is not a valid package name."),
+                )
+                .await;
+            None
+        }
     }
+}
+
+/// Returns whether every package ended up installed.
+async fn run_install(shared: Arc<Shared>, root: &Path, packages: &[String]) -> bool {
+    let client = &shared.client;
+    let Some(packages) = checked_packages(client, packages).await else {
+        return false;
+    };
+    let package = packages.join(", ");
 
     let settings = Settings::load(root);
     client
         .show_message(MessageType::INFO, format!("PyPilot: installing {package}…"))
         .await;
 
-    let ok = match install::install_package(root, &settings, package).await {
+    let ok = match install::install_packages(root, &settings, &packages).await {
         Ok(summary) if summary.ok => {
             client
                 .show_message(MessageType::INFO, format!("PyPilot: installed {package}."))
@@ -415,8 +462,8 @@ async fn run_install(shared: Arc<Shared>, root: &Path, package: &str) -> bool {
     ok
 }
 
-/// Returns whether the rebuild and the install both finished.
-async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, package: &str) -> bool {
+/// Returns whether the rebuild and every install finished.
+async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, packages: &[String]) -> bool {
     let client = &shared.client;
     let Some(version) = PyVersion::parse(python) else {
         client
@@ -427,15 +474,10 @@ async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, package: &
             .await;
         return false;
     };
-    if install::validate_package_name(package).is_err() {
-        client
-            .show_message(
-                MessageType::ERROR,
-                format!("PyPilot: `{package}` is not a valid package name."),
-            )
-            .await;
+    let Some(packages) = checked_packages(client, packages).await else {
         return false;
-    }
+    };
+    let package = packages.join(", ");
 
     let settings = Settings::load(root);
     client
@@ -445,7 +487,7 @@ async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, package: &
         )
         .await;
 
-    let ok = match install::recreate_with_python(root, &settings, version, package).await {
+    let ok = match install::recreate_with_python(root, &settings, version, &packages).await {
         Ok(summary) if summary.ok => {
             client
                 .show_message(
@@ -487,6 +529,15 @@ async fn report_failed_step(client: &Client, summary: &setup::SetupSummary) {
 
 fn string_arg(args: &[serde_json::Value], index: usize) -> Option<String> {
     args.get(index)?.as_str().map(|s| s.to_string())
+}
+
+/// Every argument from `from` on, all of which must be strings. `None` when
+/// there are none or one is not a string: a malformed call, not a package.
+fn string_args(args: &[serde_json::Value], from: usize) -> Option<Vec<String>> {
+    let rest = args.get(from..).filter(|rest| !rest.is_empty())?;
+    rest.iter()
+        .map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 // --- F5: onboarding and the CLI bridge ---------------------------------------
@@ -991,9 +1042,87 @@ pub fn run_stdio() {
                 root: Mutex::new(None),
                 documents: Mutex::new(HashMap::new()),
                 revisions: Mutex::new(HashMap::new()),
+                published: Mutex::new(HashMap::new()),
                 source: PyPiClient::new(),
             }),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_notebook_cell_maps_to_its_notebook_file() {
+        let cell =
+            Url::parse("vscode-notebook-cell:/c%3A/Users/me/proj/analysis.ipynb#W2sZmlsZQ%3D%3D")
+                .unwrap();
+        let notebook = notebook_url(&cell).unwrap();
+        assert_eq!(
+            notebook.as_str(),
+            "file:///c%3A/Users/me/proj/analysis.ipynb"
+        );
+        assert_eq!(notebook.fragment(), None);
+
+        #[cfg(windows)]
+        assert_eq!(
+            notebook.to_file_path().unwrap(),
+            PathBuf::from(r"c:\Users\me\proj\analysis.ipynb")
+        );
+
+        let posix = Url::parse("vscode-notebook-cell:/home/me/my%20proj/a.ipynb#X1").unwrap();
+        assert_eq!(
+            notebook_url(&posix).unwrap().as_str(),
+            "file:///home/me/my%20proj/a.ipynb"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            notebook_url(&posix).unwrap().to_file_path().unwrap(),
+            PathBuf::from("/home/me/my proj/a.ipynb")
+        );
+    }
+
+    #[test]
+    fn cells_of_one_notebook_share_a_key() {
+        let a = Url::parse("vscode-notebook-cell:/c%3A/p/a.ipynb#W1").unwrap();
+        let b = Url::parse("vscode-notebook-cell:/c%3A/p/a.ipynb#W2").unwrap();
+        let other = Url::parse("vscode-notebook-cell:/c%3A/p/b.ipynb#W1").unwrap();
+        assert_eq!(notebook_url(&a), notebook_url(&b));
+        assert_ne!(notebook_url(&a), notebook_url(&other));
+    }
+
+    #[test]
+    fn only_saved_notebook_cells_have_a_notebook_file() {
+        let file = Url::parse("file:///c%3A/p/main.py").unwrap();
+        assert_eq!(notebook_url(&file), None);
+        let untitled =
+            Url::parse("vscode-notebook-cell:Untitled-1.ipynb#W0sdW50aXRsZWQ%3D").unwrap();
+        assert_eq!(notebook_url(&untitled), None);
+    }
+
+    #[test]
+    fn install_arguments_take_one_or_more_names() {
+        assert_eq!(
+            string_args(&[json!("numpy")], 0),
+            Some(vec!["numpy".into()])
+        );
+        assert_eq!(
+            string_args(&[json!("numpy"), json!("pandas")], 0),
+            Some(vec!["numpy".into(), "pandas".into()])
+        );
+        // Recreate: the interpreter first, then the packages.
+        let recreate = [json!("3.12"), json!("mediapipe"), json!("tflite")];
+        assert_eq!(string_arg(&recreate, 0).as_deref(), Some("3.12"));
+        assert_eq!(
+            string_args(&recreate, 1),
+            Some(vec!["mediapipe".into(), "tflite".into()])
+        );
+
+        assert_eq!(string_args(&[], 0), None);
+        assert_eq!(string_args(&[json!("3.12")], 1), None);
+        assert_eq!(string_args(&[json!("numpy"), json!(1)], 0), None);
+    }
 }

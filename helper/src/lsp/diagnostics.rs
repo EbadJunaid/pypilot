@@ -4,16 +4,26 @@
 //! editor asks for code actions we rebuild them from the diagnostic under the
 //! cursor instead of re-analyzing the buffer.
 //!
+//! Selecting several imports adds one action that installs them all in a single
+//! command, and a whole-file (or whole-notebook) action covers what the
+//! selection cannot reach.
+//!
 //! Every install action names the distribution it will install. When an import
 //! resolves to a different name (`cv2` to `opencv-python`) the title says both,
 //! because the user is approving a name they never typed.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::*;
 
 use crate::core::guardian::{Finding, Problem};
+use crate::core::project::normalize_name;
 
 /// Command IDs. The install commands take arguments; the F5 ones do not.
+///
+/// CMD_INSTALL takes `[package, ...]` and CMD_RECREATE `[python, package, ...]`.
+/// One package is how both editors have always called them.
 pub const CMD_INSTALL: &str = "pypilot.installPackage";
 pub const CMD_RECREATE: &str = "pypilot.recreateWithPython";
 
@@ -162,49 +172,55 @@ pub fn to_diagnostic(finding: &Finding) -> Diagnostic {
     }
 }
 
-/// Rebuild quick fixes from the diagnostics the editor sent back.
-pub fn code_actions(diagnostics: &[Diagnostic]) -> Vec<CodeActionOrCommand> {
-    let mut actions = Vec::new();
+/// How far a whole-document action reaches. Only its title depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    File,
+    Notebook,
+}
 
-    for diagnostic in diagnostics {
-        // Only ours carry a FixData payload.
-        if diagnostic.source.as_deref() != Some("pypilot") {
-            continue;
-        }
-        let Some(fix) = diagnostic
-            .data
-            .clone()
-            .and_then(|d| serde_json::from_value::<FixData>(d).ok())
-        else {
-            continue;
-        };
+/// What decides whether two fixes can run as one command: the same command on
+/// the same interpreter. Mixing kinds would let one click rebuild an
+/// environment that another fix only meant to add to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FixKey {
+    Install,
+    Create {
+        python: String,
+    },
+    Recreate {
+        python: String,
+        reinstall_count: usize,
+    },
+}
 
-        let (title, command) = match &fix.action {
-            FixAction::Install => (
-                format!("Install `{}`", fix.package),
-                Command {
-                    title: format!("Install {}", fix.package),
-                    command: CMD_INSTALL.to_string(),
-                    arguments: Some(vec![serde_json::Value::String(fix.package.clone())]),
-                },
-            ),
-
-            FixAction::Create { python } => (
-                format!(
-                    "Create environment on Python {python} and install `{}`",
-                    fix.package
-                ),
-                Command {
-                    title: "Create environment".to_string(),
-                    command: CMD_RECREATE.to_string(),
-                    arguments: Some(vec![
-                        serde_json::Value::String(python.clone()),
-                        serde_json::Value::String(fix.package.clone()),
-                    ]),
-                },
-            ),
-
+impl FixKey {
+    fn of(action: &FixAction) -> Option<Self> {
+        match action {
+            FixAction::Install => Some(FixKey::Install),
+            FixAction::Create { python } => Some(FixKey::Create {
+                python: python.clone(),
+            }),
             FixAction::Recreate {
+                python,
+                reinstall_count,
+            } => Some(FixKey::Recreate {
+                python: python.clone(),
+                reinstall_count: *reinstall_count,
+            }),
+            FixAction::None => None,
+        }
+    }
+
+    /// The action title for installing `what`, which is either one quoted name
+    /// or a phrase like "3 packages: numpy, pandas, requests".
+    fn title(&self, what: &str) -> String {
+        match self {
+            FixKey::Install => format!("Install {what}"),
+            FixKey::Create { python } => {
+                format!("Create environment on Python {python} and install {what}")
+            }
+            FixKey::Recreate {
                 python,
                 reinstall_count,
             } => {
@@ -215,33 +231,206 @@ pub fn code_actions(diagnostics: &[Diagnostic]) -> Vec<CodeActionOrCommand> {
                     1 => " (1 existing package will be reinstalled)".to_string(),
                     n => format!(" ({n} existing packages will be reinstalled)"),
                 };
-                (
-                    format!(
-                        "Rebuild environment on Python {python} and install `{}`{scope}",
-                        fix.package
-                    ),
-                    Command {
-                        title: "Rebuild environment".to_string(),
-                        command: CMD_RECREATE.to_string(),
-                        arguments: Some(vec![
-                            serde_json::Value::String(python.clone()),
-                            serde_json::Value::String(fix.package.clone()),
-                        ]),
-                    },
-                )
+                format!("Rebuild environment on Python {python} and install {what}{scope}")
             }
+        }
+    }
 
-            FixAction::None => continue,
+    /// CMD_INSTALL takes `[pkg, ...]`, CMD_RECREATE `[python, pkg, ...]`.
+    fn command(&self, packages: &[String]) -> Command {
+        let names = packages.iter().cloned().map(serde_json::Value::String);
+        let (title, command, arguments) = match self {
+            FixKey::Install => (
+                format!("Install {}", packages.join(", ")),
+                CMD_INSTALL,
+                names.collect(),
+            ),
+            FixKey::Create { python } => (
+                "Create environment".to_string(),
+                CMD_RECREATE,
+                std::iter::once(serde_json::Value::String(python.clone()))
+                    .chain(names)
+                    .collect(),
+            ),
+            FixKey::Recreate { python, .. } => (
+                "Rebuild environment".to_string(),
+                CMD_RECREATE,
+                std::iter::once(serde_json::Value::String(python.clone()))
+                    .chain(names)
+                    .collect(),
+            ),
         };
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+        Command {
             title,
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diagnostic.clone()]),
-            command: Some(command),
-            is_preferred: Some(true),
-            ..Default::default()
-        }));
+            command: command.to_string(),
+            arguments: Some(arguments),
+        }
+    }
+}
+
+/// Automatable fixes sharing one [`FixKey`], each package listed once.
+struct Group<'a> {
+    key: FixKey,
+    packages: Vec<String>,
+    diagnostics: Vec<&'a Diagnostic>,
+}
+
+impl Group<'_> {
+    fn same_packages(&self, other: &Group) -> bool {
+        let set = |g: &Group| -> HashSet<String> {
+            g.packages.iter().map(|p| normalize_name(p)).collect()
+        };
+        self.key == other.key && set(self) == set(other)
+    }
+}
+
+/// Our diagnostics with their decoded fixes. Only ours carry a FixData payload.
+fn fixes(diagnostics: &[Diagnostic]) -> impl Iterator<Item = (&Diagnostic, FixData)> {
+    diagnostics.iter().filter_map(|diagnostic| {
+        if diagnostic.source.as_deref() != Some("pypilot") {
+            return None;
+        }
+        let fix = serde_json::from_value::<FixData>(diagnostic.data.clone()?).ok()?;
+        Some((diagnostic, fix))
+    })
+}
+
+/// Group automatable fixes by kind, in the order they first appear. The same
+/// import used twice is two diagnostics but one package to install.
+fn groups(diagnostics: &[Diagnostic]) -> Vec<Group<'_>> {
+    let mut groups: Vec<Group> = Vec::new();
+    for (diagnostic, fix) in fixes(diagnostics) {
+        let Some(key) = FixKey::of(&fix.action) else {
+            continue;
+        };
+        let index = match groups.iter().position(|g| g.key == key) {
+            Some(i) => i,
+            None => {
+                groups.push(Group {
+                    key,
+                    packages: Vec::new(),
+                    diagnostics: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[index];
+        group.diagnostics.push(diagnostic);
+        let name = normalize_name(&fix.package);
+        if !group.packages.iter().any(|p| normalize_name(p) == name) {
+            group.packages.push(fix.package);
+        }
+    }
+    groups
+}
+
+/// Package names for a title. Past a handful the list stops informing and
+/// starts pushing the rest of the menu off screen.
+fn name_list(packages: &[String]) -> String {
+    const SHOWN: usize = 4;
+    if packages.len() <= SHOWN {
+        packages.join(", ")
+    } else {
+        let head = &packages[..SHOWN - 1];
+        format!(
+            "{} and {} more",
+            head.join(", "),
+            packages.len() - head.len()
+        )
+    }
+}
+
+fn quick_fix(
+    title: String,
+    command: Command,
+    diagnostics: Option<Vec<Diagnostic>>,
+    preferred: bool,
+) -> CodeActionOrCommand {
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics,
+        command: Some(command),
+        is_preferred: preferred.then_some(true),
+        ..Default::default()
+    })
+}
+
+/// Quick fixes for a selection alone, with nothing else known about the file.
+#[cfg(test)]
+pub fn code_actions(diagnostics: &[Diagnostic]) -> Vec<CodeActionOrCommand> {
+    code_actions_in(diagnostics, &[], Scope::File)
+}
+
+/// Quick fixes for `selection`, plus one action covering `whole`, the
+/// diagnostics last published for the document (or every open cell of its
+/// notebook).
+///
+/// Order: a combined action per fix kind with 2+ packages selected, then one
+/// action per package, then the whole-document action. The combined action is
+/// the preferred one when it exists, so "apply preferred fix" installs the
+/// selection in one go instead of picking a single package. The whole-document
+/// action exists because notebook cells cannot be selected together, so a
+/// selection never reaches past the cell it is in.
+pub fn code_actions_in(
+    selection: &[Diagnostic],
+    whole: &[Diagnostic],
+    scope: Scope,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    let selected = groups(selection);
+
+    for group in selected.iter().filter(|g| g.packages.len() >= 2) {
+        let what = format!(
+            "{} packages: {}",
+            group.packages.len(),
+            name_list(&group.packages)
+        );
+        actions.push(quick_fix(
+            group.key.title(&what),
+            group.key.command(&group.packages),
+            Some(group.diagnostics.iter().map(|d| (*d).clone()).collect()),
+            actions.is_empty(),
+        ));
+    }
+    let combined = !actions.is_empty();
+
+    let mut offered: Vec<(FixKey, String)> = Vec::new();
+    for (diagnostic, fix) in fixes(selection) {
+        let Some(key) = FixKey::of(&fix.action) else {
+            continue;
+        };
+        let name = normalize_name(&fix.package);
+        if offered.iter().any(|(k, n)| *k == key && *n == name) {
+            continue;
+        }
+        offered.push((key.clone(), name));
+        actions.push(quick_fix(
+            key.title(&format!("`{}`", fix.package)),
+            key.command(std::slice::from_ref(&fix.package)),
+            Some(vec![diagnostic.clone()]),
+            !combined,
+        ));
+    }
+
+    let place = match scope {
+        Scope::File => "file",
+        Scope::Notebook => "notebook",
+    };
+    for group in groups(whole).iter().filter(|g| g.packages.len() >= 2) {
+        if selected.iter().any(|s| s.same_packages(group)) {
+            continue;
+        }
+        let what = format!(
+            "all {} missing packages in this {place}",
+            group.packages.len()
+        );
+        actions.push(quick_fix(
+            group.key.title(&what),
+            group.key.command(&group.packages),
+            None,
+            false,
+        ));
     }
 
     actions
@@ -361,5 +550,172 @@ mod tests {
             ..Default::default()
         };
         assert!(code_actions(&[other]).is_empty());
+    }
+
+    fn missing(package: &str) -> Diagnostic {
+        to_diagnostic(&finding(Problem::NotInstalled, package, false))
+    }
+
+    fn rebuild(package: &str, python: u8) -> Diagnostic {
+        to_diagnostic(&finding(
+            Problem::IncompatibleInterpreter {
+                current: PyVersion::py3(13),
+                supported: supported(&[9, 10, 11, python]),
+                target: Some(PyVersion::py3(python)),
+                reinstall_count: 3,
+            },
+            package,
+            false,
+        ))
+    }
+
+    fn unwrap(action: &CodeActionOrCommand) -> &CodeAction {
+        match action {
+            CodeActionOrCommand::CodeAction(a) => a,
+            CodeActionOrCommand::Command(_) => panic!("expected a code action"),
+        }
+    }
+
+    fn args(action: &CodeAction) -> Vec<String> {
+        let command = action.command.as_ref().expect("runs a command");
+        command
+            .arguments
+            .iter()
+            .flatten()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn selecting_several_imports_offers_one_install_for_all() {
+        let selection = [missing("numpy"), missing("pandas"), missing("requests")];
+        let actions = code_actions(&selection);
+        assert_eq!(
+            actions.len(),
+            4,
+            "one combined action, then one per package"
+        );
+
+        let combined = unwrap(&actions[0]);
+        assert_eq!(
+            combined.title,
+            "Install 3 packages: numpy, pandas, requests"
+        );
+        assert_eq!(combined.is_preferred, Some(true));
+        assert_eq!(combined.command.as_ref().unwrap().command, CMD_INSTALL);
+        assert_eq!(args(combined), vec!["numpy", "pandas", "requests"]);
+        assert_eq!(combined.diagnostics.as_ref().map(Vec::len), Some(3));
+
+        // Only one preferred action, so "apply preferred fix" is unambiguous.
+        for single in &actions[1..] {
+            let single = unwrap(single);
+            assert!(single.title.starts_with("Install `"), "{}", single.title);
+            assert_eq!(single.is_preferred, None);
+            assert_eq!(args(single).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_single_selection_is_unchanged() {
+        let actions = code_actions(&[missing("numpy")]);
+        assert_eq!(actions.len(), 1);
+        let only = unwrap(&actions[0]);
+        assert_eq!(only.title, "Install `numpy`");
+        assert_eq!(only.is_preferred, Some(true));
+        assert_eq!(args(only), vec!["numpy"]);
+    }
+
+    #[test]
+    fn the_same_package_twice_counts_once() {
+        let selection = [missing("numpy"), missing("numpy"), missing("pandas")];
+        let actions = code_actions(&selection);
+        let combined = unwrap(&actions[0]);
+        assert_eq!(combined.title, "Install 2 packages: numpy, pandas");
+        assert_eq!(args(combined), vec!["numpy", "pandas"]);
+        assert_eq!(actions.len(), 3, "no duplicate per-package actions");
+
+        // Two diagnostics for one package is still a single install.
+        assert_eq!(code_actions(&[missing("numpy"), missing("numpy")]).len(), 1);
+    }
+
+    #[test]
+    fn mixed_fix_kinds_are_not_combined() {
+        let actions = code_actions(&[missing("numpy"), rebuild("mediapipe", 12)]);
+        assert_eq!(actions.len(), 2);
+        assert!(actions
+            .iter()
+            .all(|a| !unwrap(a).title.contains("packages:")));
+
+        // Rebuilds aimed at different interpreters are different fixes too.
+        let actions = code_actions(&[rebuild("mediapipe", 12), rebuild("tflite", 11)]);
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn rebuilds_on_one_interpreter_combine() {
+        let actions = code_actions(&[rebuild("mediapipe", 12), rebuild("tflite", 12)]);
+        assert_eq!(actions.len(), 3);
+        let combined = unwrap(&actions[0]);
+        assert_eq!(
+            combined.title,
+            "Rebuild environment on Python 3.12 and install 2 packages: mediapipe, tflite \
+             (3 existing packages will be reinstalled)"
+        );
+        assert_eq!(combined.command.as_ref().unwrap().command, CMD_RECREATE);
+        assert_eq!(args(combined), vec!["3.12", "mediapipe", "tflite"]);
+    }
+
+    #[test]
+    fn long_package_lists_are_truncated_in_the_title() {
+        let names = ["a1", "b2", "c3", "d4", "e5", "f6"];
+        let selection: Vec<Diagnostic> = names.iter().map(|n| missing(n)).collect();
+        let combined = code_actions(&selection).remove(0);
+        let combined = unwrap(&combined);
+        assert_eq!(combined.title, "Install 6 packages: a1, b2, c3 and 3 more");
+        assert_eq!(args(combined).len(), 6, "the command still installs all");
+    }
+
+    #[test]
+    fn whole_notebook_action_reaches_past_the_selection() {
+        let whole = [missing("numpy"), missing("pandas"), missing("requests")];
+        let actions = code_actions_in(&[missing("numpy")], &whole, Scope::Notebook);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(unwrap(&actions[0]).is_preferred, Some(true));
+
+        let all = unwrap(&actions[1]);
+        assert_eq!(all.title, "Install all 3 missing packages in this notebook");
+        assert_eq!(all.is_preferred, None);
+        assert_eq!(args(all), vec!["numpy", "pandas", "requests"]);
+    }
+
+    #[test]
+    fn whole_file_action_is_offered_without_a_selection() {
+        let whole = [missing("numpy"), missing("pandas")];
+        let actions = code_actions_in(&[], &whole, Scope::File);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            unwrap(&actions[0]).title,
+            "Install all 2 missing packages in this file"
+        );
+    }
+
+    #[test]
+    fn whole_file_action_is_skipped_when_the_selection_already_covers_it() {
+        let whole = [missing("numpy"), missing("pandas")];
+        let selection = [missing("pandas"), missing("numpy")];
+        let actions = code_actions_in(&selection, &whole, Scope::File);
+        assert_eq!(actions.len(), 3);
+        assert!(actions
+            .iter()
+            .all(|a| !unwrap(a).title.contains("in this file")));
+    }
+
+    #[test]
+    fn whole_file_action_needs_two_installable_packages() {
+        let whole = [
+            missing("numpy"),
+            to_diagnostic(&finding(Problem::NotOnPyPi, "nmupy", false)),
+        ];
+        assert!(code_actions_in(&[], &whole, Scope::File).is_empty());
     }
 }

@@ -1,7 +1,7 @@
 //! The actions behind F4's code actions.
 //!
-//! Two operations: add one package to the current environment, and rebuild the
-//! environment on a different Python before adding it. Both record the package
+//! Two operations: add packages to the current environment, and rebuild the
+//! environment on a different Python before adding them. Both record the package
 //! in the project manifest, because an install that vanishes on the next clone
 //! has not really solved the user's problem.
 //!
@@ -27,28 +27,85 @@ pub async fn install_package(
     settings: &Settings,
     package: &str,
 ) -> crate::Result<SetupSummary> {
+    install_packages(workspace, settings, &[package.to_string()]).await
+}
+
+/// Packages that can share one installer invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    pub index_url: Option<String>,
+    pub packages: Vec<String>,
+}
+
+/// Split packages into as few installer invocations as possible.
+///
+/// An index URL applies to every package in the command that carries it, so
+/// torch pinned to a CUDA index must not drag numpy onto that index, where it
+/// may not exist at all. Packages on the default index go first, together, so
+/// a `requirements.txt` migration never runs against a custom index; each
+/// distinct index URL then gets its own invocation.
+pub fn batch_by_index(packages: Vec<(String, Option<String>)>) -> Vec<Batch> {
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut default = Vec::new();
+    for (package, index_url) in packages {
+        let Some(url) = index_url else {
+            default.push(package);
+            continue;
+        };
+        match batches
+            .iter_mut()
+            .find(|b| b.index_url.as_ref() == Some(&url))
+        {
+            Some(batch) => batch.packages.push(package),
+            None => batches.push(Batch {
+                index_url: Some(url),
+                packages: vec![package],
+            }),
+        }
+    }
+    if !default.is_empty() {
+        batches.insert(
+            0,
+            Batch {
+                index_url: None,
+                packages: default,
+            },
+        );
+    }
+    batches
+}
+
+/// Install `packages` into the project's existing environment and record them.
+///
+/// One installer run per [`Batch`], and the manifest is frozen once at the end,
+/// so a single package behaves exactly like [`install_package`] always has.
+pub async fn install_packages(
+    workspace: &Path,
+    settings: &Settings,
+    packages: &[String],
+) -> crate::Result<SetupSummary> {
     let mode = settings.resolve_mode().await;
     let mut summary = SetupSummary {
         package_manager: settings.package_manager,
         resolved_mode: mode,
         python: None,
         venv_path: workspace.join(".venv"),
-        why: format!("Installing {package}."),
+        why: format!("Installing {}.", packages.join(", ")),
         steps: Vec::new(),
         ok: true,
     };
 
-    let pkgs = vec![package.to_string()];
-
     // Unpinned here — this path installs whatever "the package" resolves to
     // right now, so F2 solves against the newest curated release.
-    let hardware = matrix::solve::solve_framework(package, None, settings).await;
-    if let Some(solved) = &hardware {
-        if let Some(finding) = &solved.finding {
+    let mut solved = Vec::with_capacity(packages.len());
+    for package in packages {
+        let hardware = matrix::solve::solve_framework(package, None, settings).await;
+        if let Some(finding) = hardware.as_ref().and_then(|h| h.finding.as_ref()) {
             push(&mut summary, "GPU/CUDA check", true, &finding.detail);
         }
+        solved.push((package.clone(), hardware.and_then(|h| h.index_url)));
     }
-    let index_url = hardware.as_ref().and_then(|h| h.index_url.as_deref());
+    let batches = batch_by_index(solved);
 
     match mode {
         ResolvedMode::UvFull => {
@@ -88,36 +145,35 @@ pub async fn install_package(
             // `uv add` records the dep in pyproject.toml AND installs it, so
             // this is always the right call — whether pyproject existed before
             // or was just created by `uv init`. If a requirements.txt exists
-            // alongside, use the migration helper which pulls existing entries
-            // into the new pyproject before adding the requested package.
+            // alongside, the first batch goes through the migration helper,
+            // which pulls existing entries into the new pyproject before adding
+            // the requested packages.
             let pyproject_was_new = !has_pyproject;
-            let result = if pyproject_was_new {
-                uv::add_with_requirements_migration(&uv_info, &pkgs, index_url, workspace).await
-            } else {
-                uv::add(&uv_info, &pkgs, index_url, workspace).await
-            };
+            for (i, batch) in batches.iter().enumerate() {
+                let index_url = batch.index_url.as_deref();
+                let step = format!("uv add {}", batch.packages.join(" "));
+                let result = if pyproject_was_new && i == 0 {
+                    uv::add_with_requirements_migration(
+                        &uv_info,
+                        &batch.packages,
+                        index_url,
+                        workspace,
+                    )
+                    .await
+                } else {
+                    uv::add(&uv_info, &batch.packages, index_url, workspace).await
+                };
 
-            match result {
-                Ok(out) if out.success() => {
-                    push(
+                match result {
+                    Ok(out) if out.success() => push(
                         &mut summary,
-                        &format!("uv add {package}"),
+                        &step,
                         true,
                         "installed and recorded in pyproject.toml",
-                    );
+                    ),
+                    Ok(out) => push(&mut summary, &step, false, out.stderr.trim()),
+                    Err(e) => push(&mut summary, &step, false, &e.to_string()),
                 }
-                Ok(out) => push(
-                    &mut summary,
-                    &format!("uv add {package}"),
-                    false,
-                    out.stderr.trim(),
-                ),
-                Err(e) => push(
-                    &mut summary,
-                    &format!("uv add {package}"),
-                    false,
-                    &e.to_string(),
-                ),
             }
         }
         ResolvedMode::UvPipCompat => {
@@ -138,28 +194,21 @@ pub async fn install_package(
                 );
                 return Ok(summary);
             }
-            match uv::pip_install(&uv_info, &pkgs, index_url, workspace).await {
-                Ok(out) if out.success() => {
-                    push(
-                        &mut summary,
-                        &format!("uv pip install {package}"),
-                        true,
-                        "installed",
-                    );
-                    freeze_into_requirements_uv(&uv_info, workspace, &mut summary).await;
+            let mut any_installed = false;
+            for batch in &batches {
+                let index_url = batch.index_url.as_deref();
+                let step = format!("uv pip install {}", batch.packages.join(" "));
+                match uv::pip_install(&uv_info, &batch.packages, index_url, workspace).await {
+                    Ok(out) if out.success() => {
+                        push(&mut summary, &step, true, "installed");
+                        any_installed = true;
+                    }
+                    Ok(out) => push(&mut summary, &step, false, out.stderr.trim()),
+                    Err(e) => push(&mut summary, &step, false, &e.to_string()),
                 }
-                Ok(out) => push(
-                    &mut summary,
-                    &format!("uv pip install {package}"),
-                    false,
-                    out.stderr.trim(),
-                ),
-                Err(e) => push(
-                    &mut summary,
-                    &format!("uv pip install {package}"),
-                    false,
-                    &e.to_string(),
-                ),
+            }
+            if any_installed {
+                freeze_into_requirements_uv(&uv_info, workspace, &mut summary).await;
             }
         }
         ResolvedMode::PurePip => {
@@ -173,30 +222,23 @@ pub async fn install_package(
                 );
                 return Ok(summary);
             }
-            match pip::install_packages(&venv, &pkgs, index_url, workspace).await {
-                Ok(out) if out.success() => {
-                    push(
-                        &mut summary,
-                        &format!("pip install {package}"),
-                        true,
-                        "installed",
-                    );
-                    // Freeze the full venv state into requirements.txt so the
-                    // file tracks exact pinned versions rather than bare names.
-                    freeze_into_requirements(&venv, workspace, &mut summary).await;
+            let mut any_installed = false;
+            for batch in &batches {
+                let index_url = batch.index_url.as_deref();
+                let step = format!("pip install {}", batch.packages.join(" "));
+                match pip::install_packages(&venv, &batch.packages, index_url, workspace).await {
+                    Ok(out) if out.success() => {
+                        push(&mut summary, &step, true, "installed");
+                        any_installed = true;
+                    }
+                    Ok(out) => push(&mut summary, &step, false, out.stderr.trim()),
+                    Err(e) => push(&mut summary, &step, false, &e.to_string()),
                 }
-                Ok(out) => push(
-                    &mut summary,
-                    &format!("pip install {package}"),
-                    false,
-                    out.stderr.trim(),
-                ),
-                Err(e) => push(
-                    &mut summary,
-                    &format!("pip install {package}"),
-                    false,
-                    &e.to_string(),
-                ),
+            }
+            // Freeze the full venv state into requirements.txt so the file
+            // tracks exact pinned versions rather than bare names.
+            if any_installed {
+                freeze_into_requirements(&venv, workspace, &mut summary).await;
             }
         }
     }
@@ -204,7 +246,7 @@ pub async fn install_package(
     Ok(summary)
 }
 
-/// Rebuild the environment on `version`, then install `package` into it.
+/// Rebuild the environment on `version` once, then install `packages` into it.
 ///
 /// The caller has already told the user how many packages this reinstalls, so
 /// this does the work without asking again.
@@ -212,7 +254,7 @@ pub async fn recreate_with_python(
     workspace: &Path,
     settings: &Settings,
     version: PyVersion,
-    package: &str,
+    packages: &[String],
 ) -> crate::Result<SetupSummary> {
     let mode = settings.resolve_mode().await;
     let venv_path = workspace.join(".venv");
@@ -221,7 +263,10 @@ pub async fn recreate_with_python(
         resolved_mode: mode,
         python: Some(version),
         venv_path: venv_path.clone(),
-        why: format!("Rebuilding the environment on Python {version} so {package} can install."),
+        why: format!(
+            "Rebuilding the environment on Python {version} so {} can install.",
+            packages.join(", ")
+        ),
         steps: Vec::new(),
         ok: true,
     };
@@ -459,8 +504,8 @@ pub async fn recreate_with_python(
         }
     }
 
-    // Now the package that started all this.
-    let add = install_package(workspace, settings, package).await?;
+    // Now the packages that started all this.
+    let add = install_packages(workspace, settings, packages).await?;
     summary.steps.extend(add.steps);
     summary.ok = summary.ok && add.ok;
     Ok(summary)
@@ -587,6 +632,25 @@ pub fn validate_package_name(name: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// Validate and dedupe the package names one command asked for.
+///
+/// Duplicates are dropped by their PEP 503 name, keeping the first spelling, so
+/// `PyYAML` and `pyyaml` from two diagnostics become one install. On failure the
+/// error carries the first rejected name, for the caller to show.
+pub fn validate_package_names(names: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if validate_package_name(name).is_err() {
+            return Err(name.clone());
+        }
+        if seen.insert(crate::core::project::normalize_name(name)) {
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +662,72 @@ mod tests {
         assert!(validate_package_name("").is_err());
         assert!(validate_package_name("   ").is_err());
         assert!(validate_package_name("--upgrade").is_err());
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn package_lists_are_validated_and_deduped() {
+        assert_eq!(
+            validate_package_names(&names(&["numpy", "PyYAML", "pyyaml", "numpy"])),
+            Ok(names(&["numpy", "PyYAML"]))
+        );
+        assert_eq!(
+            validate_package_names(&names(&["numpy", "--index-url", "pandas"])),
+            Err("--index-url".to_string())
+        );
+        assert_eq!(
+            validate_package_names(&names(&["numpy", " "])),
+            Err(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn gpu_index_packages_get_their_own_invocation() {
+        let cuda = "https://download.pytorch.org/whl/cu124".to_string();
+        let batches = batch_by_index(vec![
+            ("torch".into(), Some(cuda.clone())),
+            ("numpy".into(), None),
+            ("torchaudio".into(), Some(cuda.clone())),
+            ("pandas".into(), None),
+        ]);
+        assert_eq!(
+            batches,
+            vec![
+                Batch {
+                    index_url: None,
+                    packages: names(&["numpy", "pandas"]),
+                },
+                Batch {
+                    index_url: Some(cuda),
+                    packages: names(&["torch", "torchaudio"]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_indexes_never_share_an_invocation() {
+        let batches = batch_by_index(vec![
+            ("torch".into(), Some("https://a.example/cu124".into())),
+            ("tensorflow".into(), Some("https://b.example/cpu".into())),
+        ]);
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|b| b.packages.len() == 1));
+    }
+
+    #[test]
+    fn a_single_package_is_a_single_invocation() {
+        assert_eq!(
+            batch_by_index(vec![("numpy".into(), None)]),
+            vec![Batch {
+                index_url: None,
+                packages: names(&["numpy"]),
+            }]
+        );
+        assert!(batch_by_index(Vec::new()).is_empty());
     }
 
     #[test]
