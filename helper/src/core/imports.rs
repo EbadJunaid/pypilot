@@ -134,6 +134,85 @@ pub fn extract_attr_uses(source: &str, bases: &[String]) -> Vec<AttrUse> {
     out
 }
 
+/// Cell magics whose body is still Python run by the kernel, so its imports are
+/// real. Any other cell magic (`%%bash`, `%%writefile`, `%%html`) hands the body
+/// to something else, and scanning it as Python would invent problems.
+const PYTHON_CELL_MAGICS: &[&str] = &[
+    "time", "timeit", "capture", "prun", "debug", "python", "python3",
+];
+
+/// Blank out IPython-only syntax in a notebook cell so the scanners see Python.
+///
+/// Line magics (`%pip install x`), shell escapes (`!ls`, `files = !ls`) and help
+/// requests (`?obj`, `obj?`) are not Python. Left in, a stray quote in a shell
+/// command opens a "string" that swallows the imports below it, and
+/// `!python -c mp.solutions` reads as an attribute access. Lines are blanked
+/// rather than removed so every other line keeps its number.
+///
+/// Only for notebook cells: in a `.py` file a line starting with `%` continues
+/// an expression, it is not a magic.
+pub fn mask_ipython(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+
+    // `%%name` must open the cell. If the kernel does not run the body as
+    // Python, none of the cell is ours to check.
+    if let Some(first) = lines.iter().map(|l| l.trim()).find(|l| !l.is_empty()) {
+        if let Some(magic) = first.strip_prefix("%%") {
+            let name = magic.split_whitespace().next().unwrap_or("");
+            if !PYTHON_CELL_MAGICS.contains(&name) {
+                return "\n".repeat(lines.len());
+            }
+        }
+    }
+
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut open_delim: Option<&'static str> = None;
+    for raw in lines {
+        let in_string = open_delim.is_some();
+        let (code, next_delim) = strip_strings_and_comments(raw, open_delim);
+        // A masked line's quotes mean nothing, so it must not move string state.
+        if !in_string && is_ipython_line(raw, &code) {
+            out.push("");
+            continue;
+        }
+        open_delim = next_delim;
+        out.push(raw);
+    }
+    out.join("\n")
+}
+
+/// `raw` is the line as written, `code` the same line with strings and comments
+/// blanked, so a `?` or `=` inside a string literal never counts.
+fn is_ipython_line(raw: &str, code: &str) -> bool {
+    let trimmed = raw.trim_start();
+    if trimmed.starts_with(['%', '!', '?']) {
+        return true;
+    }
+    // `obj?` / `obj??`. Python has no `?` operator, so outside a string this is
+    // always a help request.
+    if code.trim_end().ends_with('?') {
+        return true;
+    }
+    // `files = !ls`, `t = %timeit -o f()`. An assignment whose right side starts
+    // with `!` or `%` is never valid Python, so this cannot catch real code.
+    let chars: Vec<char> = code.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '=' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        if matches!(prev, Some('=' | '!' | '<' | '>')) || next == Some('=') {
+            continue;
+        }
+        let rhs = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+        if matches!(rhs, Some('!' | '%')) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -357,6 +436,84 @@ mod tests {
     fn not_an_import_statement() {
         assert!(modules("important = 1\n").is_empty());
         assert!(modules("fromage = 2\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod notebook_tests {
+    use super::*;
+
+    fn cell_modules(src: &str) -> Vec<(String, u32)> {
+        extract(&mask_ipython(src))
+            .into_iter()
+            .map(|i| (i.module, i.line))
+            .collect()
+    }
+
+    #[test]
+    fn magics_and_shell_escapes_are_not_imports() {
+        let src = "%pip install requests\n!pip install flask\n%matplotlib inline\nimport numpy\n";
+        assert_eq!(cell_modules(src), vec![("numpy".to_string(), 3)]);
+    }
+
+    #[test]
+    fn a_quote_in_a_shell_command_does_not_swallow_later_imports() {
+        // Unmasked, the `'''` opens a "docstring" that hides `import pandas`.
+        assert!(modules_unmasked("!echo '''\nimport pandas\n").is_empty());
+        assert_eq!(
+            cell_modules("!echo '''\nimport pandas\n"),
+            vec![("pandas".to_string(), 1)]
+        );
+        assert_eq!(
+            cell_modules("files = !ls '''\nimport requests\n"),
+            vec![("requests".to_string(), 1)]
+        );
+    }
+
+    fn modules_unmasked(src: &str) -> Vec<String> {
+        extract(src).into_iter().map(|i| i.module).collect()
+    }
+
+    #[test]
+    fn help_requests_are_masked() {
+        let masked = mask_ipython("?np\n??np.linalg\nnp.linalg.norm?\nimport os\n");
+        assert_eq!(masked.lines().filter(|l| !l.is_empty()).count(), 1);
+        assert_eq!(
+            cell_modules("?np\nimport os\n"),
+            vec![("os".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn python_cell_magics_keep_their_body() {
+        assert_eq!(
+            cell_modules("%%time\nimport numpy\n"),
+            vec![("numpy".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn foreign_cell_magics_hide_the_whole_cell() {
+        assert!(cell_modules("%%writefile helpers.py\nimport requests\n").is_empty());
+        assert!(cell_modules("\n%%bash\nimport requests\n").is_empty());
+    }
+
+    #[test]
+    fn real_python_is_left_alone() {
+        let src = "x = a != b\ny = (c\n     % d)\ns = \"why?\"\nz = 1 # really?\n";
+        // Only the `% d` continuation looks like a magic, and it holds no import.
+        let masked = mask_ipython(src);
+        assert!(masked.contains("x = a != b"));
+        assert!(masked.contains("s = \"why?\""));
+        assert!(masked.contains("z = 1 # really?"));
+    }
+
+    #[test]
+    fn masked_shell_lines_produce_no_attribute_uses() {
+        let src = "import mediapipe as mp\n!python -c mp.solutions\nx = mp.tasks\n";
+        let uses = extract_attr_uses(&mask_ipython(src), &["mp".to_string()]);
+        let attrs: Vec<String> = uses.into_iter().map(|u| u.attr).collect();
+        assert_eq!(attrs, vec!["tasks"]);
     }
 }
 

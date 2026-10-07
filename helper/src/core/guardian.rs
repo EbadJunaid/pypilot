@@ -135,7 +135,33 @@ pub async fn analyze_buffer<S: MetadataSource>(
     installed: &Installed,
     metadata: &S,
 ) -> Vec<Finding> {
-    let local = local_modules(workspace);
+    analyze_buffer_in(
+        source,
+        workspace,
+        None,
+        platform,
+        venv_python,
+        installed,
+        metadata,
+    )
+    .await
+}
+
+/// [`analyze_buffer`] for a buffer whose file lives in `document_dir`.
+///
+/// Python puts a script's own directory on `sys.path`, and Jupyter starts a
+/// notebook's kernel there, so a `helpers.py` next to the file is local even
+/// when it is nowhere near the workspace root.
+pub async fn analyze_buffer_in<S: MetadataSource>(
+    source: &str,
+    workspace: &Path,
+    document_dir: Option<&Path>,
+    platform: Platform,
+    venv_python: Option<PyVersion>,
+    installed: &Installed,
+    metadata: &S,
+) -> Vec<Finding> {
+    let local = local_modules(workspace, document_dir);
 
     // Keep every occurrence for the squiggles, but resolve each package once.
     let candidates: Vec<(ImportRef, String, bool)> = imports::extract(source)
@@ -257,9 +283,15 @@ pub fn check_attributes(source: &str, venv: &Path, installed: &Installed) -> Vec
 
 /// Module names that belong to this project, so `import utils` next to
 /// `utils.py` never gets reported as a missing PyPI package.
-fn local_modules(workspace: &Path) -> HashSet<String> {
+fn local_modules(workspace: &Path, document_dir: Option<&Path>) -> HashSet<String> {
     let mut names = HashSet::new();
-    for root in [workspace.to_path_buf(), workspace.join("src")] {
+    let mut roots = vec![workspace.to_path_buf(), workspace.join("src")];
+    if let Some(dir) = document_dir {
+        if !roots.iter().any(|r| r == dir) {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
@@ -374,6 +406,19 @@ mod tests {
                 target: Some(PyVersion::py3(12))
             }
         );
+    }
+
+    #[test]
+    fn modules_beside_the_document_are_local() {
+        let ws = std::env::temp_dir().join("pypilot-local-modules-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        let notebooks = ws.join("notebooks");
+        std::fs::create_dir_all(&notebooks).unwrap();
+        std::fs::write(notebooks.join("helpers.py"), "").unwrap();
+
+        assert!(!local_modules(&ws, None).contains("helpers"));
+        assert!(local_modules(&ws, Some(&notebooks)).contains("helpers"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

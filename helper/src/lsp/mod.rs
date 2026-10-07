@@ -11,6 +11,9 @@
 //! user stops typing. Each edit supersedes the pending run for that buffer, so a
 //! burst of keystrokes costs one analysis rather than one per character.
 //!
+//! VS Code sends each Jupyter notebook cell as its own document. Cells are
+//! analyzed like files, with IPython magics masked out, and published per cell.
+//!
 //! A CLI run started from a Zed task leaves a request file behind (see
 //! [`crate::core::rescan`]); a watcher polls it and re-raises the notification,
 //! which is how a terminal command surfaces in the editor.
@@ -29,7 +32,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::core::platform::Platform;
 use crate::core::{
-    guardian, install, installed, rescan, setup, solver, Assessment, FixKind, Severity,
+    guardian, imports, install, installed, rescan, setup, solver, Assessment, FixKind, Severity,
 };
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{MetadataSource, PyPiClient};
@@ -58,10 +61,17 @@ const BTN_MODE_PIP_COMPAT: &str = "pip-compatible (requirements.txt, faster via 
 /// How long the buffer must be idle before the guardian runs.
 const IDLE_DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// VS Code syncs each notebook cell as its own text document under this scheme,
+/// e.g. `vscode-notebook-cell:/c%3A/proj/analysis.ipynb#W2sZmlsZQ%3D%3D`: the
+/// path is the notebook, the fragment names the cell.
+const NOTEBOOK_CELL_SCHEME: &str = "vscode-notebook-cell";
+
 /// An open buffer, as of the client's latest version of it.
 struct Document {
     version: i32,
     text: String,
+    /// Only consulted for notebook cells, where markdown cells share the scheme.
+    language_id: String,
 }
 
 /// State shared between request handlers and spawned background tasks.
@@ -131,6 +141,7 @@ impl LanguageServer for Backend {
         let document = Document {
             version: params.text_document.version,
             text: params.text_document.text,
+            language_id: params.text_document.language_id,
         };
         self.shared
             .documents
@@ -151,14 +162,17 @@ impl LanguageServer for Backend {
             let mut documents = self.shared.documents.lock().await;
             // tower-lsp runs notifications concurrently, so two quick edits can
             // be handled out of order. Never let the older text win.
-            if documents.get(&uri).is_some_and(|d| d.version >= version) {
-                return;
-            }
+            let language_id = match documents.get(&uri) {
+                Some(d) if d.version >= version => return,
+                Some(d) => d.language_id.clone(),
+                None => String::new(),
+            };
             documents.insert(
                 uri.clone(),
                 Document {
                     version,
                     text: change.text,
+                    language_id,
                 },
             );
         }
@@ -270,21 +284,32 @@ impl LanguageServer for Backend {
 
 /// Analyze one buffer and publish its diagnostics.
 async fn run_guardian(shared: Arc<Shared>, uri: Url) {
-    let Ok(path) = uri.to_file_path() else { return };
-    if path.extension().is_some_and(|e| e != "py") {
-        return;
-    }
+    let cell = uri.scheme() == NOTEBOOK_CELL_SCHEME;
+    // The file on disk, used to find modules sitting next to it. An untitled
+    // notebook has none, and its cells are still worth checking.
+    let path = if cell {
+        notebook_url(&uri).and_then(|u| u.to_file_path().ok())
+    } else {
+        let Ok(path) = uri.to_file_path() else { return };
+        if path.extension().is_some_and(|e| e != "py") {
+            return;
+        }
+        Some(path)
+    };
 
     let Some(root) = shared.root.lock().await.clone() else {
         return;
     };
-    let Some(text) = shared
-        .documents
-        .lock()
-        .await
-        .get(&uri)
-        .map(|d| d.text.clone())
-    else {
+    let Some(text) = shared.documents.lock().await.get(&uri).and_then(|d| {
+        // A notebook's markdown cells arrive under the same scheme.
+        if cell && d.language_id != "python" {
+            None
+        } else if cell {
+            Some(imports::mask_ipython(&d.text))
+        } else {
+            Some(d.text.clone())
+        }
+    }) else {
         return;
     };
 
@@ -299,9 +324,10 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
     let installed = installed::scan(&venv);
     let venv_python = venv_python(&venv);
 
-    let mut findings = guardian::analyze_buffer(
+    let mut findings = guardian::analyze_buffer_in(
         &text,
         &root,
+        path.as_deref().and_then(Path::parent),
         Platform::current(),
         venv_python,
         &installed,
@@ -318,6 +344,21 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
         .client
         .publish_diagnostics(uri, published, None)
         .await;
+}
+
+/// The notebook a `vscode-notebook-cell` URI belongs to, as a `file` URL: same
+/// path, cell fragment dropped. `None` for anything that is not a cell.
+///
+/// Built from the encoded path rather than via `set_scheme`, which refuses to
+/// move a URL from a custom scheme to `file`.
+fn notebook_url(uri: &Url) -> Option<Url> {
+    // An untitled notebook's path is relative (`Untitled-1.ipynb`), and glued
+    // after `file://` it would read as a network host.
+    if uri.scheme() != NOTEBOOK_CELL_SCHEME || !uri.path().starts_with('/') {
+        return None;
+    }
+    let host = uri.host_str().unwrap_or("");
+    Url::parse(&format!("file://{host}{}", uri.path())).ok()
 }
 
 /// Re-analyze every open buffer, so fixed imports stop being marked.
