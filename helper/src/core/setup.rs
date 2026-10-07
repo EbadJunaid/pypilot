@@ -10,13 +10,19 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::command::Output;
 use crate::core::solver;
-use crate::core::{pip, uv};
+use crate::core::{installed, pip, project, uv};
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::MetadataSource;
 use crate::settings::{PackageManager, ResolvedMode, Settings};
 
 /// One executed step, for a human-readable summary.
+///
+/// A step with `ok == false` usually means the whole run failed, but not
+/// always: optional extras (see [`ensure_ipykernel`]) record their failure here
+/// so the user sees it, while leaving [`SetupSummary::ok`] alone because what
+/// the user actually asked for succeeded.
 #[derive(Debug, Clone)]
 pub struct Step {
     pub name: String,
@@ -33,7 +39,8 @@ pub struct SetupSummary {
     pub venv_path: PathBuf,
     pub why: String,
     pub steps: Vec<Step>,
-    /// Overall success (all critical steps ok).
+    /// Overall success (all critical steps ok). Non-fatal steps may fail
+    /// without clearing this.
     pub ok: bool,
 }
 
@@ -101,7 +108,112 @@ pub async fn run_with_mode<S: MetadataSource>(
         ResolvedMode::PurePip => run_pip(workspace, &assessment, &venv_path, &mut summary).await,
     }
 
+    ensure_ipykernel(workspace, settings, mode, &mut summary).await;
     Ok(summary)
+}
+
+/// Step name for the notebook kernel install, shared by setup and install.
+pub(crate) const IPYKERNEL_STEP: &str = "ipykernel (for notebooks)";
+
+/// Make the project's `.venv` usable as a Jupyter kernel when the project has
+/// notebooks.
+///
+/// VS Code and Jupyter only offer an environment as a kernel when `ipykernel`
+/// is installed in it; otherwise the notebook silently runs on some other
+/// Python, where none of the packages PyPilot just installed exist. Called at
+/// the end of every flow that builds or changes the environment.
+///
+/// Non-fatal by design: the user's own install already succeeded, so a failure
+/// here is recorded as a failed step without clearing [`SetupSummary::ok`].
+/// Skipped when the run already failed, when there is no `.venv`, when the
+/// project has no notebooks, or when a usable `ipykernel` is already installed
+/// (see [`installed::has_usable_ipykernel`]).
+pub(crate) async fn ensure_ipykernel(
+    workspace: &Path,
+    settings: &Settings,
+    mode: ResolvedMode,
+    summary: &mut SetupSummary,
+) {
+    let venv = workspace.join(".venv");
+    if summary.failed()
+        || !venv.is_dir()
+        || installed::has_usable_ipykernel(&installed::scan(&venv), venv_python(&venv))
+        || !project::has_notebooks(workspace)
+    {
+        return;
+    }
+    // One argv element; the `>=` floor also upgrades a too-old ipykernel.
+    let packages = vec![installed::IPYKERNEL_REQUIREMENT.to_string()];
+
+    let result = match mode {
+        ResolvedMode::UvFull | ResolvedMode::UvPipCompat => {
+            let uv_info = match uv::ensure(settings).await {
+                Ok(info) => info,
+                Err(e) => {
+                    soft_fail(summary, IPYKERNEL_STEP, &e.to_string());
+                    return;
+                }
+            };
+            // A dev dependency keeps it out of the runtime requirements. Without
+            // a pyproject.toml (uv init was skipped), there is nowhere to record
+            // a group, so fall back to a plain install into the venv.
+            if mode == ResolvedMode::UvFull && workspace.join("pyproject.toml").is_file() {
+                outcome(uv::add_dev(&uv_info, &packages, workspace).await)
+                    .map(|_| "added to the dev dependency group".to_string())
+            } else {
+                match outcome(uv::pip_install(&uv_info, &packages, None, workspace).await) {
+                    Ok(_) if mode == ResolvedMode::UvPipCompat => {
+                        match outcome(uv::pip_freeze(&uv_info, workspace).await).and_then(|out| {
+                            std::fs::write(workspace.join("requirements.txt"), out)
+                                .map_err(|e| e.to_string())
+                        }) {
+                            Ok(()) => Ok("installed; requirements.txt updated".to_string()),
+                            Err(e) => Ok(format!(
+                                "installed, but updating requirements.txt failed: {e}"
+                            )),
+                        }
+                    }
+                    Ok(_) => Ok("installed".to_string()),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+        ResolvedMode::PurePip => {
+            match outcome(pip::install_packages(&venv, &packages, None, workspace).await) {
+                Ok(_) => match outcome(pip::freeze_requirements(&venv, workspace).await) {
+                    Ok(_) => Ok("installed; requirements.txt updated".to_string()),
+                    Err(e) => Ok(format!(
+                        "installed, but updating requirements.txt failed: {e}"
+                    )),
+                },
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    match result {
+        Ok(detail) => step_ok(summary, IPYKERNEL_STEP, &detail),
+        Err(e) => soft_fail(
+            summary,
+            IPYKERNEL_STEP,
+            &format!("{e} (notebooks will not see this environment until ipykernel is installed)"),
+        ),
+    }
+}
+
+/// The Python version a venv was created with, from its `pyvenv.cfg`.
+fn venv_python(venv: &Path) -> Option<PyVersion> {
+    let text = std::fs::read_to_string(venv.join("pyvenv.cfg")).ok()?;
+    crate::core::probe::parse_pyvenv_version(&text)
+}
+
+/// Collapse a process result into its stdout on success or a one-line reason.
+fn outcome(result: crate::Result<Output>) -> Result<String, String> {
+    match result {
+        Ok(out) if out.success() => Ok(out.stdout),
+        Ok(out) => Err(out.stderr.trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 async fn run_uv_full(
@@ -496,6 +608,16 @@ fn step_ok(summary: &mut SetupSummary, name: &str, detail: &str) {
     summary.steps.push(Step {
         name: name.to_string(),
         ok: true,
+        detail: detail.to_string(),
+    });
+}
+
+/// Record a failed step that must not fail the run: it is shown with the
+/// other steps, but [`SetupSummary::ok`] keeps its value.
+fn soft_fail(summary: &mut SetupSummary, name: &str, detail: &str) {
+    summary.steps.push(Step {
+        name: name.to_string(),
+        ok: false,
         detail: detail.to_string(),
     });
 }

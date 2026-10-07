@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::bail;
 
-use crate::core::setup::{SetupSummary, Step};
+use crate::core::setup::{self, SetupSummary, Step};
 use crate::core::{pip, uv};
 use crate::matrix;
 use crate::pypi::pyversion::PyVersion;
@@ -241,6 +241,17 @@ pub async fn install_packages(
                 freeze_into_requirements(&venv, workspace, &mut summary).await;
             }
         }
+    }
+
+    // Notebooks need ipykernel in the venv. This is also the tail of
+    // `recreate_with_python`, which ends here and so never needs its own call.
+    // When the user asked for ipykernel themselves, the install above already
+    // did the job.
+    let asked_for_ipykernel = packages
+        .iter()
+        .any(|p| crate::core::project::requirement_name(p).as_deref() == Some("ipykernel"));
+    if !asked_for_ipykernel {
+        setup::ensure_ipykernel(workspace, settings, mode, &mut summary).await;
     }
 
     Ok(summary)
@@ -656,14 +667,6 @@ mod tests {
     use super::*;
     use crate::settings::PackageManager;
 
-    #[test]
-    fn rejects_names_that_would_become_flags() {
-        assert!(validate_package_name("mediapipe").is_ok());
-        assert!(validate_package_name("").is_err());
-        assert!(validate_package_name("   ").is_err());
-        assert!(validate_package_name("--upgrade").is_err());
-    }
-
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -728,6 +731,14 @@ mod tests {
             }]
         );
         assert!(batch_by_index(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn rejects_names_that_would_become_flags() {
+        assert!(validate_package_name("mediapipe").is_ok());
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("   ").is_err());
+        assert!(validate_package_name("--upgrade").is_err());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::core::project::normalize_name;
+use crate::pypi::pyversion::PyVersion;
 
 /// Packages present in a virtualenv, normalized per PEP 503.
 #[derive(Debug, Clone, Default)]
@@ -32,6 +33,48 @@ impl Installed {
     pub fn version_of(&self, name: &str) -> Option<String> {
         self.versions.get(&normalize_name(name)).cloned()
     }
+}
+
+/// The requirement PyPilot installs so notebooks can use the venv as a kernel.
+///
+/// The floor matters: ipykernel before 7.0.1 fails to connect kernels on
+/// Python 3.14 (notably on Windows), so a bare `ipykernel` could resolve to a
+/// cached or pinned release that installs fine and still leaves the notebook
+/// unable to start.
+pub const IPYKERNEL_REQUIREMENT: &str = "ipykernel>=7.0.1";
+
+/// Can Jupyter / VS Code use this venv as a notebook kernel?
+///
+/// True when `ipykernel` is installed, except that on Python 3.14+ a release
+/// older than 7.0.1 counts as missing (it cannot connect there). An unknown
+/// version or unknown Python is given the benefit of the doubt, so PyPilot
+/// never nags about something it cannot verify.
+pub fn has_usable_ipykernel(installed: &Installed, python: Option<PyVersion>) -> bool {
+    if !installed.contains("ipykernel") {
+        return false;
+    }
+    let needs_new = python.is_some_and(|p| p >= PyVersion::py3(14));
+    if !needs_new {
+        return true;
+    }
+    match installed.version_of("ipykernel") {
+        Some(v) => release_tuple(&v) >= (7, 0, 1),
+        None => true,
+    }
+}
+
+/// The leading `major.minor.patch` of a version string, missing parts as 0.
+/// Pre-release suffixes are cut, so `7.0.0rc1` reads as `(7, 0, 0)`.
+fn release_tuple(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.split('.').map(|p| {
+        let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().unwrap_or(0)
+    });
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
 }
 
 /// Read the installed distributions from a venv directory.
@@ -147,6 +190,39 @@ mod tests {
         assert!(installed.contains("opencv_python"));
         assert!(installed.contains("OpenCV-Python"));
         assert!(!installed.contains("opencv"));
+    }
+
+    fn with_ipykernel(version: Option<&str>) -> Installed {
+        let mut installed = Installed {
+            packages: ["ipykernel".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        if let Some(v) = version {
+            installed.versions.insert("ipykernel".into(), v.into());
+        }
+        installed
+    }
+
+    #[test]
+    fn old_ipykernel_is_missing_only_on_python_314_and_later() {
+        let old = with_ipykernel(Some("6.29.5"));
+        let new = with_ipykernel(Some("7.0.1"));
+        let py313 = Some(PyVersion::py3(13));
+        let py314 = Some(PyVersion::py3(14));
+
+        assert!(has_usable_ipykernel(&old, py313));
+        assert!(!has_usable_ipykernel(&old, py314));
+        assert!(!has_usable_ipykernel(
+            &with_ipykernel(Some("7.0.0rc1")),
+            py314
+        ));
+        assert!(has_usable_ipykernel(&new, py314));
+        assert!(has_usable_ipykernel(&with_ipykernel(Some("7.10")), py314));
+        // Unverifiable: don't nag.
+        assert!(has_usable_ipykernel(&old, None));
+        assert!(has_usable_ipykernel(&with_ipykernel(None), py314));
+        // Not installed at all.
+        assert!(!has_usable_ipykernel(&Installed::default(), py313));
     }
 
     #[test]

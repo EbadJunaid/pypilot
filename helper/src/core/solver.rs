@@ -26,15 +26,27 @@ pub struct EnvSummary {
     pub venv_python: Option<PyVersion>,
     pub uv_present: bool,
     pub interpreters: Vec<PyVersion>,
+    /// The workspace contains at least one `.ipynb`.
+    pub has_notebooks: bool,
+    /// The venv has an `ipykernel` that works on its Python, so Jupyter and
+    /// VS Code can use it as a kernel.
+    pub venv_has_ipykernel: bool,
 }
 
 impl EnvSummary {
-    fn from_probes(p: &Probes) -> EnvSummary {
+    fn from_probes(p: &Probes, workspace: &Path) -> EnvSummary {
         EnvSummary {
             has_venv: p.venv.is_some(),
             venv_python: p.venv.as_ref().and_then(|v| v.python),
             uv_present: p.uv.is_some(),
             interpreters: p.interpreters.iter().map(|i| i.version).collect(),
+            has_notebooks: crate::core::project::has_notebooks(workspace),
+            venv_has_ipykernel: p.venv.as_ref().is_some_and(|v| {
+                crate::core::installed::has_usable_ipykernel(
+                    &crate::core::installed::scan(&v.path),
+                    v.python,
+                )
+            }),
         }
     }
 }
@@ -57,7 +69,7 @@ pub async fn assess<S: MetadataSource>(
     // F2 seam (empty in Phase 1).
     let hardware = matrix::check(workspace, settings, &project.packages).await;
 
-    let env = EnvSummary::from_probes(&probes);
+    let env = EnvSummary::from_probes(&probes, workspace);
     let (target_python, mut findings) = synthesize(&env, &project, compat.as_ref());
     findings.extend(hardware.findings);
 
@@ -134,7 +146,20 @@ pub fn synthesize(
 ) -> (Option<PyVersion>, Vec<Finding>) {
     let mut findings = Vec::new();
 
-    // Not a Python project at all → stay entirely silent.
+    // Notebooks run on whatever kernel Jupyter can find, and an environment
+    // without ipykernel is not one. Checked before the Python-project gate: a
+    // `.venv` next to notebooks is reason enough, even with no manifest or
+    // `.py` file. With no venv at all, the "no environment" finding covers it.
+    if env.has_venv && env.has_notebooks && !env.venv_has_ipykernel {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            title: "Notebooks can't use .venv yet".to_string(),
+            detail: "This project has Jupyter notebooks, but its environment has no usable ipykernel (7.0.1+ is needed on Python 3.14), so VS Code and Jupyter can't offer it as a kernel and fall back to another Python where the project's packages are missing. Set up the environment to install ipykernel.".to_string(),
+            fix: FixKind::SetupEnvironment,
+        });
+    }
+
+    // Not a Python project at all → stay silent (bar the notebook kernel above).
     if !project.is_python_project() {
         return (None, findings);
     }
@@ -335,6 +360,7 @@ mod tests {
             venv_python: Some(PyVersion::py3(13)),
             uv_present: true,
             interpreters: vec![PyVersion::py3(13)],
+            ..Default::default()
         };
         let (target, findings) = synthesize(&env, &python_project(), Some(&compat));
         assert_eq!(target, Some(PyVersion::py3(12)));
@@ -355,6 +381,7 @@ mod tests {
             venv_python: Some(PyVersion::py3(12)),
             uv_present: true,
             interpreters: vec![PyVersion::py3(12)],
+            ..Default::default()
         };
         let (_t, findings) = synthesize(&env, &python_project(), Some(&compat));
         assert!(findings.iter().all(|f| f.severity == Severity::Info));
@@ -369,6 +396,47 @@ mod tests {
         let f = &findings[0];
         assert_eq!(f.fix, FixKind::SetupEnvironment);
         assert!(f.detail.contains("mediapipe"));
+    }
+
+    #[test]
+    fn notebooks_without_ipykernel_suggest_setup() {
+        let compat = report(vec![analysis("numpy", &[9, 10, 11, 12, 13])]);
+        let env = EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(12)),
+            has_notebooks: true,
+            venv_has_ipykernel: false,
+            ..Default::default()
+        };
+        let (_t, findings) = synthesize(&env, &python_project(), Some(&compat));
+        let f = findings
+            .iter()
+            .find(|f| f.title == "Notebooks can't use .venv yet")
+            .unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.fix, FixKind::SetupEnvironment);
+        assert!(f.detail.contains("ipykernel"));
+
+        // Already a kernel: silent again.
+        let ready = EnvSummary {
+            venv_has_ipykernel: true,
+            ..env.clone()
+        };
+        let (_t, findings) = synthesize(&ready, &python_project(), Some(&compat));
+        assert!(findings.iter().all(|f| f.severity == Severity::Info));
+
+        // No venv: only the existing "no environment" finding, not this one.
+        let none = EnvSummary {
+            has_notebooks: true,
+            ..Default::default()
+        };
+        let (_t, findings) = synthesize(&none, &python_project(), Some(&compat));
+        assert!(findings
+            .iter()
+            .all(|f| f.title != "Notebooks can't use .venv yet"));
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "No environment set up yet"));
     }
 
     #[test]

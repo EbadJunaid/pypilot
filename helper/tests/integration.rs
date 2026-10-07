@@ -67,6 +67,7 @@ async fn mediapipe_on_313_is_diagnosed_and_312_suggested() {
         venv_python: Some(PyVersion::py3(13)),
         uv_present: true,
         interpreters: vec![PyVersion::py3(13)],
+        ..Default::default()
     };
     let (target, findings) = synthesize(&env, &python_project(&["mediapipe"]), Some(&report));
     assert_eq!(target, Some(PyVersion::py3(12)));

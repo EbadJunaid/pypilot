@@ -101,9 +101,15 @@ pub fn scan(workspace: &Path) -> ProjectDeps {
         deps.sources.push(env_yml);
     }
 
-    // A bare `.py` file also makes this a Python project even with no manifest.
-    if deps.sources.is_empty() && has_python_file(workspace) {
-        deps.sources.push(workspace.join("*.py"));
+    // A bare `.py` file also makes this a Python project even with no manifest,
+    // and so does a notebook: a folder of `.ipynb` files needs an environment
+    // with a kernel just as much.
+    if deps.sources.is_empty() {
+        if has_python_file(workspace) {
+            deps.sources.push(workspace.join("*.py"));
+        } else if has_notebooks(workspace) {
+            deps.sources.push(workspace.join("*.ipynb"));
+        }
     }
 
     deps.packages = dedupe(names);
@@ -455,6 +461,61 @@ fn has_python_file(dir: &Path) -> bool {
         .any(|e| e.path().extension().is_some_and(|x| x == "py"))
 }
 
+/// How deep [`has_notebooks`] looks below the workspace root. Notebooks live in
+/// `notebooks/`, `examples/`, `docs/tutorials/` and the like, rarely deeper, and
+/// the walk runs on every assessment, so it has to stay cheap on huge repos.
+const NOTEBOOK_SEARCH_DEPTH: usize = 4;
+
+/// Directories that never hold the user's own notebooks: environments, VCS and
+/// build output, and Jupyter's own autosave copies.
+const NOTEBOOK_SKIP_DIRS: &[&str] = &[
+    ".venv",
+    "venv",
+    "env",
+    ".git",
+    "node_modules",
+    ".ipynb_checkpoints",
+    "__pycache__",
+    "target",
+];
+
+/// Does the workspace contain any Jupyter notebook?
+///
+/// A notebook can only run on an environment that has `ipykernel`; without it
+/// VS Code and Jupyter quietly pick some other Python. This decides whether
+/// PyPilot needs to care. Bounded to [`NOTEBOOK_SEARCH_DEPTH`] levels, skips
+/// environments (by name and by `pyvenv.cfg`), and stops at the first hit.
+pub fn has_notebooks(workspace: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut subdirs = Vec::new();
+        for entry in rd.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_file() {
+                if path.extension().is_some_and(|x| x == "ipynb") {
+                    return true;
+                }
+            } else if kind.is_dir() && depth > 0 {
+                let name = entry.file_name();
+                let skip = NOTEBOOK_SKIP_DIRS.iter().any(|s| name == *s)
+                    || path.join("pyvenv.cfg").is_file();
+                if !skip {
+                    subdirs.push(path);
+                }
+            }
+        }
+        // Files at this level first, so a root-level notebook never pays for
+        // the subdirectory walk.
+        subdirs.into_iter().any(|d| walk(&d, depth - 1))
+    }
+    walk(workspace, NOTEBOOK_SEARCH_DEPTH)
+}
+
 fn dedupe(mut reqs: Vec<Requirement>) -> Vec<Requirement> {
     reqs.retain(|r| !r.name.is_empty());
     reqs.sort();
@@ -530,6 +591,38 @@ pub fn conda_migration_pyproject(deps: &ProjectDeps, project_name: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notebooks_are_found_but_not_inside_environments() {
+        let ws = std::env::temp_dir().join("pypilot-notebook-detect-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("main.py"), "").unwrap();
+        assert!(!has_notebooks(&ws));
+
+        // Notebooks inside environments, checkpoints, or any dir holding a
+        // pyvenv.cfg are someone else's, not the project's.
+        for skipped in [".venv/share", ".ipynb_checkpoints", "node_modules/x"] {
+            std::fs::create_dir_all(ws.join(skipped)).unwrap();
+            std::fs::write(ws.join(skipped).join("a.ipynb"), "{}").unwrap();
+        }
+        std::fs::create_dir_all(ws.join("myenv")).unwrap();
+        std::fs::write(ws.join("myenv").join("pyvenv.cfg"), "").unwrap();
+        std::fs::write(ws.join("myenv").join("b.ipynb"), "{}").unwrap();
+        assert!(!has_notebooks(&ws));
+
+        // Deeper than the bound is not looked at.
+        let deep = ws.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.ipynb"), "{}").unwrap();
+        assert!(!has_notebooks(&ws));
+
+        // Within the bound is found.
+        std::fs::write(ws.join("a/b/c/d/ok.ipynb"), "{}").unwrap();
+        assert!(has_notebooks(&ws));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     #[test]
     fn normalize_examples() {
@@ -708,6 +801,19 @@ requests = "^2.31"
         assert!(!toml.contains("requires-python"));
         assert!(toml.contains("name = \"project\""));
         assert!(toml.contains("dependencies = []"));
+    }
+
+    #[test]
+    fn a_folder_of_notebooks_is_a_python_project() {
+        let dir = std::env::temp_dir().join("pypilot-notebook-only-project");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("analysis.ipynb"), "{}").unwrap();
+
+        let deps = scan(&dir);
+        assert!(deps.is_python_project());
+        assert!(deps.packages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn req(name: &str, spec: &str) -> Requirement {

@@ -369,6 +369,24 @@ pub async fn add(
     command::run(&uv.path, &args, Some(cwd)).await
 }
 
+/// `uv add --dev <pkgs...>` — records the packages in the `dev` dependency group
+/// and installs them.
+///
+/// Used for tooling the editor needs but the program does not, such as
+/// `ipykernel` for notebooks: it must never become a runtime dependency that
+/// ships with the user's package.
+pub async fn add_dev(uv: &UvInfo, packages: &[String], cwd: &Path) -> crate::Result<Output> {
+    command::run(&uv.path, &add_dev_args(packages), Some(cwd)).await
+}
+
+/// The argument vector for [`add_dev`], split out so a test can assert on it
+/// without needing a uv binary present.
+fn add_dev_args(packages: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["add".into(), "--dev".into()];
+    args.extend(packages.iter().cloned());
+    args
+}
+
 /// `uv pip install <pkgs...>` into the project venv.
 ///
 /// `index_url` overrides the default index for this call only — used to point
@@ -626,6 +644,14 @@ mod tests {
         assert_eq!(args[python_idx + 1], project_target.to_string());
         assert_ne!(args[python_idx + 1], system_looking_default.to_string());
         assert!(args.iter().any(|a| a == "--system"));
+    }
+
+    #[test]
+    fn dev_add_targets_the_dev_group() {
+        // Regression guard: dropping `--dev` would put ipykernel into the
+        // project's runtime dependencies.
+        let args = add_dev_args(&["ipykernel".to_string()]);
+        assert_eq!(args, vec!["add", "--dev", "ipykernel"]);
     }
 
     #[test]
