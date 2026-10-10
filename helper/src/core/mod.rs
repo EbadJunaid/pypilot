@@ -22,6 +22,7 @@ pub mod rescan;
 pub mod setup;
 pub mod solver;
 pub mod stdlib;
+pub mod toolchain;
 pub mod torch_gpu;
 pub mod uv;
 
