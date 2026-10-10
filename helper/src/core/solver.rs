@@ -73,6 +73,13 @@ pub async fn assess<S: MetadataSource>(
     let (target_python, mut findings) = synthesize(&env, &project, compat.as_ref());
     findings.extend(hardware.findings);
 
+    // A CPU torch on an NVIDIA machine, however it got there: checked against
+    // what is installed, not what is declared, since a later install can swap
+    // the CUDA build out without touching any manifest.
+    if let Some(venv) = &probes.venv {
+        findings.extend(crate::core::torch_gpu::static_check(&venv.path, settings).await);
+    }
+
     // F3's hybrid confirmation: metadata explains which package would be the
     // blocker; a real `uv --dry-run` resolve confirms the answer is actually
     // installable, catching version conflicts wheel-tag analysis can't see
