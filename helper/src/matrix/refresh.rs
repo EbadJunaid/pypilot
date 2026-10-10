@@ -18,11 +18,12 @@ use crate::settings::Settings;
 const BASE_URL: &str =
     "https://raw.githubusercontent.com/Abdullah-Masood-05/pypilot/main/helper/data";
 
-/// The three datasets, paired with the bundled fallback and the refresh URL.
+/// The datasets, paired with the bundled fallback and the refresh URL.
 pub const DATASETS: &[(&str, &str)] = &[
     ("nvidia.json", crate::matrix::NVIDIA_JSON),
     ("frameworks.json", crate::matrix::FRAMEWORKS_JSON),
     ("import_map.json", crate::matrix::IMPORT_MAP_JSON),
+    ("cuda_extensions.json", crate::matrix::CUDA_EXTENSIONS_JSON),
 ];
 
 fn cache_path(name: &str) -> PathBuf {

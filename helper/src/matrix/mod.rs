@@ -13,12 +13,17 @@
 //! [`solve::solve_framework`] is also called directly by the install path so
 //! a real `torch` install pulls the build matched to the driver.
 //!
+//! [`cuda_ext`] covers the CUDA extension packages (flash-attn, xformers,
+//! bitsandbytes, ...) whose install trouble is platform wheels and torch
+//! coupling rather than the driver.
+//!
 //! The bundled datasets (`data/nvidia.json`, `data/frameworks.json`,
-//! `data/import_map.json`) are embedded at compile time so an offline machine
+//! `data/import_map.json`, `data/cuda_extensions.json`) are embedded at compile time so an offline machine
 //! always has a correct snapshot; [`refresh`] overlays newer copies fetched
 //! from the project repo, TTL-gated by F7's `data_refresh_days`, and falls
 //! back to the bundled snapshot silently on any failure.
 
+pub mod cuda_ext;
 pub mod frameworks;
 pub mod nvidia;
 pub mod refresh;
@@ -31,11 +36,12 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::core::gpu::{self, Accelerator};
-use crate::core::platform::Os;
+use crate::core::platform::{Os, Platform};
 use crate::core::project::Requirement;
 use crate::core::Finding;
 use crate::settings::Settings;
-use frameworks::Framework;
+use cuda_ext::ExtensionTable;
+use frameworks::{Framework, FrameworkTable};
 
 /// F7's documented default TTL, used where a caller has no `Settings` in
 /// scope to read the user's configured value from (see [`import_map`]).
@@ -45,6 +51,7 @@ const DEFAULT_TTL_DAYS: u32 = 7;
 pub const NVIDIA_JSON: &str = include_str!("../../data/nvidia.json");
 pub const FRAMEWORKS_JSON: &str = include_str!("../../data/frameworks.json");
 pub const IMPORT_MAP_JSON: &str = include_str!("../../data/import_map.json");
+pub const CUDA_EXTENSIONS_JSON: &str = include_str!("../../data/cuda_extensions.json");
 
 /// GPU / driver facts, for the report.
 #[derive(Debug, Clone, Default)]
@@ -66,9 +73,10 @@ pub struct HardwareReport {
 /// its own disk cache, and any data refresh happens in the background without
 /// this call waiting on it.
 ///
-/// Silent by construction for everything except torch/tensorflow: packages
-/// this module does not recognize simply produce no findings, matching the
-/// "stay silent" contract rather than emitting a Info-per-package no-op.
+/// Silent by construction for everything except torch/tensorflow and the
+/// CUDA extensions: packages this module does not recognize simply produce no
+/// findings, matching the "stay silent" contract rather than emitting a
+/// Info-per-package no-op.
 pub async fn check(
     _workspace: &Path,
     settings: &Settings,
@@ -78,8 +86,10 @@ pub async fn check(
         .iter()
         .filter(|r| Framework::from_package_name(&r.name).is_some())
         .collect();
+    let extensions = cuda_extension_table(settings.data_refresh_days);
+    let has_extensions = packages.iter().any(|r| extensions.get(&r.name).is_some());
 
-    if relevant.is_empty() {
+    if relevant.is_empty() && !has_extensions {
         return HardwareReport::default();
     }
 
@@ -87,6 +97,32 @@ pub async fn check(
     // scan without making this one wait on a network round trip. A stale
     // cache always falls back to the bundled snapshot, never to an error.
     tokio::spawn(refresh::refresh_if_stale(settings.clone()));
+
+    // Platform and pins only, no GPU: a missing wheel or a torch mismatch is
+    // a problem whatever card is installed.
+    let mut findings: Vec<Finding> = if has_extensions {
+        let frameworks = refresh::read(
+            "frameworks.json",
+            FRAMEWORKS_JSON,
+            settings.data_refresh_days,
+        );
+        let torch_versions = FrameworkTable::load(&frameworks)
+            .map(|t| t.all_versions(Framework::Torch))
+            .unwrap_or_default();
+        cuda_ext::assess_project(&extensions, packages, Platform::current(), &torch_versions)
+            .iter()
+            .map(cuda_ext::Issue::to_finding)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if relevant.is_empty() {
+        return HardwareReport {
+            gpu: None,
+            findings,
+        };
+    }
 
     let accelerator = gpu::detect().await;
     let gpu_info = Some(match &accelerator {
@@ -105,7 +141,6 @@ pub async fn check(
         Accelerator::None => GpuInfo::default(),
     });
 
-    let mut findings = Vec::new();
     for req in relevant {
         if let Some(solved) = solve::solve_framework(&req.name, Some(req), settings).await {
             findings.extend(solved.finding);
@@ -137,6 +172,24 @@ fn import_map() -> &'static HashMap<String, String> {
             .map(|f| f.map)
             .unwrap_or_default()
     })
+}
+
+/// The CUDA extension table for the assessment, read fresh so a configured
+/// `data_refresh_days` is honoured. A broken refreshed copy cannot reach here
+/// (refresh validates JSON), and a bundled one that fails to parse is caught
+/// by the tests, so the empty fallback only guards a schema change.
+fn cuda_extension_table(ttl_days: u32) -> ExtensionTable {
+    let json = refresh::read("cuda_extensions.json", CUDA_EXTENSIONS_JSON, ttl_days);
+    ExtensionTable::load(&json)
+        .or_else(|| ExtensionTable::load(CUDA_EXTENSIONS_JSON))
+        .unwrap_or_else(ExtensionTable::empty)
+}
+
+/// The CUDA extension table for the import guardian, parsed once per process
+/// like [`import_map`].
+pub fn cuda_extensions() -> &'static ExtensionTable {
+    static TABLE: OnceLock<ExtensionTable> = OnceLock::new();
+    TABLE.get_or_init(|| cuda_extension_table(DEFAULT_TTL_DAYS))
 }
 
 /// Resolve an import name to the PyPI package that provides it.
@@ -177,6 +230,8 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(NVIDIA_JSON).unwrap();
         serde_json::from_str::<serde_json::Value>(FRAMEWORKS_JSON).unwrap();
         serde_json::from_str::<serde_json::Value>(IMPORT_MAP_JSON).unwrap();
+        ExtensionTable::load(CUDA_EXTENSIONS_JSON)
+            .expect("cuda_extensions.json matches its schema");
     }
 
     #[test]
@@ -219,6 +274,23 @@ mod tests {
         assert!(
             report.gpu.is_none(),
             "GPU is not even probed when nothing needs it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cuda_extensions_reach_the_assessment_without_a_gpu_probe() {
+        // flash-attn has no binary wheel anywhere, so every OS gets a finding.
+        let settings = Settings {
+            data_refresh_days: 0,
+            ..Settings::default()
+        };
+        let packages = vec![Requirement::any("flash-attn"), Requirement::any("numpy")];
+        let report = check(Path::new("."), &settings, &packages).await;
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0].title.starts_with("flash-attn"));
+        assert!(
+            report.gpu.is_none(),
+            "wheel availability needs no GPU probe"
         );
     }
 }
