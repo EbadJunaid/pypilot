@@ -31,6 +31,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::core::gpu::{self, Accelerator};
+use crate::core::platform::Os;
 use crate::core::project::Requirement;
 use crate::core::Finding;
 use crate::settings::Settings;
@@ -155,6 +156,17 @@ pub fn is_mapped(import_name: &str) -> bool {
     import_map().contains_key(import_name)
 }
 
+/// A short note for an offer to install `package` on `os`, when the install
+/// would not give what people install it for. Today that is tensorflow on
+/// native Windows, which has had no GPU build since 2.10: an "Install
+/// tensorflow" quick fix must not read as a GPU setup there.
+pub fn install_caveat(package: &str, os: Os) -> Option<&'static str> {
+    match Framework::from_package_name(package) {
+        Some(Framework::TensorFlow) if os == Os::Windows => Some("CPU-only on native Windows"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +193,16 @@ mod tests {
         assert_eq!(resolve_package("requests"), "requests");
         assert!(!is_mapped("mediapipe"));
         assert!(is_mapped("cv2"));
+    }
+
+    #[test]
+    fn only_tensorflow_on_windows_carries_an_install_caveat() {
+        assert!(install_caveat("tensorflow", Os::Windows).is_some());
+        assert!(install_caveat("TensorFlow", Os::Windows).is_some());
+        assert!(install_caveat("tensorflow", Os::Linux).is_none());
+        assert!(install_caveat("tensorflow", Os::Macos).is_none());
+        assert!(install_caveat("torch", Os::Windows).is_none());
+        assert!(install_caveat("numpy", Os::Windows).is_none());
     }
 
     #[test]

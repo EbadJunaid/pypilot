@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::*;
 
 use crate::core::guardian::{Finding, Problem};
+use crate::core::platform::{Os, Platform};
 use crate::core::project::normalize_name;
+use crate::matrix::install_caveat;
 
 /// Command IDs. The install commands take arguments; the F5 ones do not.
 ///
@@ -340,6 +342,27 @@ fn name_list(packages: &[String]) -> String {
     }
 }
 
+/// Append any platform caveat for `packages` to an action title, so a fix
+/// that installs tensorflow on Windows does not read as a GPU setup.
+fn caveated(title: String, packages: &[String], os: Os) -> String {
+    let notes: Vec<String> = packages
+        .iter()
+        .filter_map(|p| install_caveat(p, os).map(|note| (p, note)))
+        .map(|(p, note)| {
+            if packages.len() == 1 {
+                note.to_string()
+            } else {
+                format!("{p}: {note}")
+            }
+        })
+        .collect();
+    if notes.is_empty() {
+        title
+    } else {
+        format!("{title} ({})", notes.join("; "))
+    }
+}
+
 fn quick_fix(
     title: String,
     command: Command,
@@ -379,6 +402,7 @@ pub fn code_actions_in(
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
     let selected = groups(selection);
+    let os = Platform::current().os;
 
     for group in selected.iter().filter(|g| g.packages.len() >= 2) {
         let what = format!(
@@ -387,7 +411,7 @@ pub fn code_actions_in(
             name_list(&group.packages)
         );
         actions.push(quick_fix(
-            group.key.title(&what),
+            caveated(group.key.title(&what), &group.packages, os),
             group.key.command(&group.packages),
             Some(group.diagnostics.iter().map(|d| (*d).clone()).collect()),
             actions.is_empty(),
@@ -406,7 +430,11 @@ pub fn code_actions_in(
         }
         offered.push((key.clone(), name));
         actions.push(quick_fix(
-            key.title(&format!("`{}`", fix.package)),
+            caveated(
+                key.title(&format!("`{}`", fix.package)),
+                std::slice::from_ref(&fix.package),
+                os,
+            ),
             key.command(std::slice::from_ref(&fix.package)),
             Some(vec![diagnostic.clone()]),
             !combined,
@@ -426,7 +454,7 @@ pub fn code_actions_in(
             group.packages.len()
         );
         actions.push(quick_fix(
-            group.key.title(&what),
+            caveated(group.key.title(&what), &group.packages, os),
             group.key.command(&group.packages),
             None,
             false,
@@ -469,6 +497,30 @@ mod tests {
 
         let actions = code_actions(&[d]);
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn tensorflow_install_titles_say_cpu_only_on_windows() {
+        let one = vec!["tensorflow".to_string()];
+        assert_eq!(
+            caveated("Install `tensorflow`".into(), &one, Os::Windows),
+            "Install `tensorflow` (CPU-only on native Windows)"
+        );
+        assert_eq!(
+            caveated("Install `tensorflow`".into(), &one, Os::Linux),
+            "Install `tensorflow`"
+        );
+
+        let several = vec!["numpy".to_string(), "tensorflow".to_string()];
+        assert_eq!(
+            caveated("Install 2 packages".into(), &several, Os::Windows),
+            "Install 2 packages (tensorflow: CPU-only on native Windows)"
+        );
+        let plain = vec!["numpy".to_string()];
+        assert_eq!(
+            caveated("Install `numpy`".into(), &plain, Os::Windows),
+            "Install `numpy`"
+        );
     }
 
     #[test]
