@@ -5,7 +5,7 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use crate::core::{install, project, solver, uv};
+use crate::core::{install, project, solver, torch_index, uv};
 use crate::matrix::frameworks::Framework;
 use crate::matrix::solve::solve_framework;
 use crate::pypi::MetadataSource;
@@ -54,7 +54,44 @@ async fn fix_cuda(workspace: &Path, settings: &Settings) -> crate::Result<()> {
         };
         let spec = format!("{}=={version}", req.name);
 
-        match settings.resolve_mode().await {
+        let mode = settings.resolve_mode().await;
+        let pyproject = workspace.join("pyproject.toml");
+        if mode == ResolvedMode::UvFull && pyproject.is_file() {
+            // A `uv pip install` here would be undone by the next `uv sync`,
+            // which re-resolves from the manifest. Record the index there and
+            // sync instead, so the fix survives.
+            match torch_index::pin_file(
+                &pyproject,
+                solved.index_url.as_deref(),
+                std::slice::from_ref(&req.name),
+            ) {
+                Ok(pinned) if pinned.is_pinned() => {
+                    let uv_info = uv::ensure(settings).await?;
+                    let out = uv::sync(&uv_info, workspace).await?;
+                    if out.success() {
+                        println!(
+                            "  {} {} now resolves from the matched index in pyproject.toml",
+                            "✓".green().bold(),
+                            req.name.bold()
+                        );
+                    } else {
+                        any_failed = true;
+                        if let torch_index::PinFile::Changed { original } = &pinned {
+                            std::fs::write(&pyproject, original)?;
+                        }
+                        println!("  {} failed {}", "✗".red().bold(), out.stderr.trim().red());
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => println!(
+                    "  {} pyproject.toml left as is ({e}); a later `uv sync` may swap the build",
+                    "[WARN ]".yellow().bold()
+                ),
+            }
+        }
+
+        match mode {
             ResolvedMode::UvFull | ResolvedMode::UvPipCompat => {
                 let uv_info = uv::ensure(settings).await?;
                 let out = uv::pip_install(
