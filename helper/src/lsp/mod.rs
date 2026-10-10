@@ -32,7 +32,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::core::platform::Platform;
 use crate::core::{
-    guardian, imports, install, installed, rescan, setup, solver, Assessment, FixKind, Severity,
+    guardian, imports, install, installed, probe, rescan, setup, solver, Assessment, FixKind,
+    Severity,
 };
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{MetadataSource, PyPiClient};
@@ -345,23 +346,31 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
     // Everything here is local except the PyPI lookups, which are cached and
     // only happen for imports that are neither stdlib, local, nor installed.
     let venv = root.join(".venv");
-    let installed = installed::scan(&venv);
-    let venv_python = venv_python(&venv);
+    // A venv whose Python is gone can't import anything, so per-import
+    // verdicts against it would be wrong either way. The workspace scan
+    // reports it once, with the rebuild fix; until then, stay quiet here.
+    let findings = if probe::broken_venv(&venv).is_some() {
+        Vec::new()
+    } else {
+        let installed = installed::scan(&venv);
+        let venv_python = venv_python(&venv);
 
-    let mut findings = guardian::analyze_buffer_in(
-        &text,
-        &root,
-        path.as_deref().and_then(Path::parent),
-        Platform::current(),
-        venv_python,
-        &installed,
-        &shared.source,
-    )
-    .await;
+        let mut findings = guardian::analyze_buffer_in(
+            &text,
+            &root,
+            path.as_deref().and_then(Path::parent),
+            Platform::current(),
+            venv_python,
+            &installed,
+            &shared.source,
+        )
+        .await;
 
-    // Packages that are installed still have to expose what the file uses.
-    // Purely local, so this costs a directory listing rather than a request.
-    findings.extend(guardian::check_attributes(&text, &venv, &installed));
+        // Packages that are installed still have to expose what the file uses.
+        // Purely local, so this costs a directory listing rather than a request.
+        findings.extend(guardian::check_attributes(&text, &venv, &installed));
+        findings
+    };
 
     let published: Vec<Diagnostic> = findings.iter().map(diagnostics::to_diagnostic).collect();
     {
