@@ -38,7 +38,7 @@ use serde::Deserialize;
 
 use crate::core::gpu::{self, Accelerator};
 use crate::core::platform::{Os, Platform};
-use crate::core::project::Requirement;
+use crate::core::project::{normalize_name, Requirement};
 use crate::core::Finding;
 use crate::settings::Settings;
 use cuda_ext::ExtensionTable;
@@ -69,6 +69,9 @@ pub struct GpuInfo {
 pub struct HardwareReport {
     pub gpu: Option<GpuInfo>,
     pub findings: Vec<Finding>,
+    /// Normalized names of CUDA extensions whose missing wheel a finding above
+    /// already explains, so the assessment skips the generic source-build one.
+    pub explained_source_builds: Vec<String>,
 }
 
 /// Run the hardware/ML compatibility check over a project's declared
@@ -103,7 +106,7 @@ pub async fn check(
 
     // Platform and pins only, no GPU: a missing wheel or a torch mismatch is
     // a problem whatever card is installed.
-    let mut findings: Vec<Finding> = if has_extensions {
+    let issues = if has_extensions {
         let frameworks = refresh::read(
             "frameworks.json",
             FRAMEWORKS_JSON,
@@ -113,17 +116,21 @@ pub async fn check(
             .map(|t| t.all_versions(Framework::Torch))
             .unwrap_or_default();
         cuda_ext::assess_project(&extensions, packages, Platform::current(), &torch_versions)
-            .iter()
-            .map(cuda_ext::Issue::to_finding)
-            .collect()
     } else {
         Vec::new()
     };
+    let mut findings: Vec<Finding> = issues.iter().map(cuda_ext::Issue::to_finding).collect();
+    let explained_source_builds: Vec<String> = issues
+        .iter()
+        .filter(|i| i.no_wheel)
+        .map(|i| normalize_name(&i.package))
+        .collect();
 
     if relevant.is_empty() {
         return HardwareReport {
             gpu: None,
             findings,
+            explained_source_builds,
         };
     }
 
@@ -162,6 +169,7 @@ pub async fn check(
     HardwareReport {
         gpu: gpu_info,
         findings,
+        explained_source_builds,
     }
 }
 
@@ -300,6 +308,7 @@ mod tests {
         let report = check(Path::new("."), &settings, &packages).await;
         assert_eq!(report.findings.len(), 1);
         assert!(report.findings[0].title.starts_with("flash-attn"));
+        assert_eq!(report.explained_source_builds, vec!["flash-attn"]);
         assert!(
             report.gpu.is_none(),
             "wheel availability needs no GPU probe"

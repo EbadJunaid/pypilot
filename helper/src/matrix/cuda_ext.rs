@@ -70,6 +70,10 @@ pub struct Issue {
     pub package: String,
     /// It cannot work at all here, not merely install badly.
     pub blocking: bool,
+    /// PyPI has no binary wheel for this platform, so this issue already
+    /// explains the source build (or why it cannot work). The generic
+    /// "Will compile from source" finding defers to it.
+    pub no_wheel: bool,
     pub title: String,
     /// Full sentences, naming the package; used as the editor diagnostic.
     pub detail: String,
@@ -209,6 +213,7 @@ fn wheel_issue(ext: &Extension, spec: &str, platform: Platform) -> Option<Issue>
         return Some(Issue {
             package: name.clone(),
             blocking: true,
+            no_wheel: true,
             title: format!("{name} cannot run on macOS"),
             detail: format!(
                 "{what} is a CUDA extension and macOS has no CUDA, so there is no wheel and its source build fails. {alternative}"
@@ -248,6 +253,7 @@ fn wheel_issue(ext: &Extension, spec: &str, platform: Platform) -> Option<Issue>
     Some(Issue {
         package: name.clone(),
         blocking: false,
+        no_wheel: true,
         title: format!(
             "{name} will build from source on {}",
             platform_name(platform)
@@ -326,6 +332,7 @@ fn torch_conflict(
     Some(Issue {
         package: name.clone(),
         blocking: true,
+        no_wheel: false,
         title: format!("{what} needs torch{needs}"),
         detail: format!(
             "{what} wheels are compiled against torch{needs}, but the project asks for torch{}. The install will fail to resolve or pull a different torch.{suggestion} Change one pin so they match.",
@@ -374,6 +381,7 @@ pub fn check_import(
     Some(Issue {
         package: name.clone(),
         blocking: false,
+        no_wheel: false,
         title: format!("{name} would replace torch {}", torch.raw),
         detail: format!(
             "The latest {name} ({}) is built for torch{needs}, so installing it replaces the installed torch {}, often with a build for a different CUDA. {fix}",
