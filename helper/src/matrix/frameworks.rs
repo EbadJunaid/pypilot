@@ -179,7 +179,7 @@ impl FrameworkTable {
 /// minor is whatever follows; this has held for every tag PyTorch has
 /// published (cu118, cu121, cu124, cu126, cu128, cu130, cu132, ...), so it is
 /// computed rather than curated.
-fn parse_cuda_tag(tag: &str) -> Option<CudaVersion> {
+pub(crate) fn parse_cuda_tag(tag: &str) -> Option<CudaVersion> {
     let digits = tag.strip_prefix("cu")?;
     if digits.len() < 3 {
         return None;

@@ -81,7 +81,7 @@ pub struct HardwareReport {
 /// findings, matching the "stay silent" contract rather than emitting a
 /// Info-per-package no-op.
 pub async fn check(
-    _workspace: &Path,
+    workspace: &Path,
     settings: &Settings,
     packages: &[Requirement],
 ) -> HardwareReport {
@@ -148,6 +148,13 @@ pub async fn check(
 
     for req in relevant {
         if let Some(solved) = solve::solve_framework(&req.name, Some(req), settings).await {
+            // A torch already in the venv can be the wrong build for this
+            // GPU even when the declared requirement solves cleanly, e.g. a
+            // cu121 wheel carried over from before an RTX 50-series upgrade.
+            if Framework::from_package_name(&req.name) == Some(Framework::Torch) {
+                let venv = workspace.join(".venv");
+                findings.extend(solve::check_installed_torch(&venv, &solved, settings).await);
+            }
             findings.extend(solved.finding);
         }
     }
