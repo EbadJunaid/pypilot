@@ -1,0 +1,78 @@
+# Working on PyPilot
+
+Read this before changing anything. It applies to AI agents and humans alike.
+
+## 1. Check the data tables first
+
+```bash
+python scripts/check_data.py          # add --json for machine output
+```
+
+Exit `0` = current, `1` = stale or schema break, `2` = network error.
+If it reports anything stale, **update the tables before the code change**,
+in their own commit.
+
+### What lives in `helper/data/`
+
+| File | Holds | Authoritative source |
+| --- | --- | --- |
+| `frameworks.json` | torch releases and the `cuXXX` builds each ships; tensorflow releases and their minimum CUDA | <https://pytorch.org/get-started/previous-versions/>, <https://download.pytorch.org/whl/cuXXX/torch/>, <https://www.tensorflow.org/install/source#gpu> |
+| `nvidia.json` | CUDA version to minimum driver (Linux and Windows); GPU architecture to CUDA/torch range | <https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html> (Table 3), <https://developer.nvidia.com/cuda-gpus> |
+| `cuda_extensions.json` | flash-attn, xformers, bitsandbytes, mamba-ssm, causal-conv1d: wheel platforms and torch pin per release | `https://pypi.org/pypi/<pkg>/json`, `https://pypi.org/pypi/<pkg>/<version>/json` (`requires_dist`) |
+| `import_map.json` | import name to PyPI name where they differ | the package's PyPI page |
+
+### Why it matters
+
+These files are compiled into the engine (`include_str!` in
+`helper/src/matrix/mod.rs`) **and** every released engine re-downloads them from
+`main` every `data_refresh_days` (default 7; `helper/src/matrix/refresh.rs`).
+Data pushed to `main` reaches all users within about a week, no release needed.
+It also means a broken table breaks engines already in the field.
+
+### Schema-compatibility rules
+
+Older engines parse whatever is on `main`. So:
+
+- Only **append rows** or **change values**.
+- Never rename, remove or retype a field; never change a number to a string or
+  an array to an object. New optional fields are fine (unknown fields are
+  ignored by older engines).
+- Keep version strings in the existing format (`"2.9.1"`, `"cu130"`, `"12.8"`).
+- `check_data.py` compares every file against the latest git tag and flags
+  removed keys and changed types.
+
+### Updating
+
+1. Edit the JSON (keep rows sorted by version, LF endings).
+2. `cargo test -p pypilot-helper` (tests load the bundled tables).
+3. Re-run `python scripts/check_data.py`.
+4. Commit data alone: `data: add torch 2.14 CUDA builds`.
+
+Then make the code change.
+
+## 2. Commit conventions
+
+- Small, logical commits; conventional prefixes (`feat(scope):`, `fix:`,
+  `test:`, `docs:`, `ci:`, `chore:`, `data:`).
+- **Never** add `Co-Authored-By` or any AI/tool trailer to commits or PRs.
+- LF line endings.
+- Do not push, tag or bump versions unless asked.
+
+Before every commit that touches Rust:
+
+```bash
+cargo fmt
+cargo clippy -p pypilot-helper --all-targets -- -D warnings
+cargo test -p pypilot-helper
+cargo build -p pypilot-zed --target wasm32-wasip2
+```
+
+## 3. Release order
+
+1. **Engine** (this repo): bump `Cargo.toml` and `extension/extension.toml`,
+   tag `vX.Y.Z`, wait for the Release workflow to upload the binaries.
+2. **pip package** (`pypilot-pip`): only after step 1's binaries exist, bump
+   `DEFAULT_TAG` in `src/pypilot/binary.py` to the new engine tag, then release.
+3. **VS Code extension** (`pypilot-vscode`): independent of the engine version.
+
+Data-only changes need none of this: merge to `main` and they ship.
