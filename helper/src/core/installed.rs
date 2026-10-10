@@ -126,7 +126,7 @@ pub fn scan(venv: &Path) -> Installed {
 }
 
 /// The version out of a `.dist-info` directory name, if it has one.
-fn distribution_version(entry: &str) -> Option<String> {
+pub(crate) fn distribution_version(entry: &str) -> Option<String> {
     let stem = entry
         .strip_suffix(".dist-info")
         .or_else(|| entry.strip_suffix(".egg-info"))?;
@@ -165,7 +165,7 @@ pub fn site_packages_dirs(venv: &Path) -> Vec<PathBuf> {
 /// Pull the distribution name out of a `.dist-info` or `.egg-info` directory.
 ///
 /// `charset_normalizer-3.3.2.dist-info` -> `charset-normalizer`.
-fn distribution_name(entry: &str) -> Option<String> {
+pub(crate) fn distribution_name(entry: &str) -> Option<String> {
     let stem = entry
         .strip_suffix(".dist-info")
         .or_else(|| entry.strip_suffix(".egg-info"))?;
