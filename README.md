@@ -28,7 +28,7 @@ For pip-installed frameworks, the host NVIDIA display driver determines compatib
 Pinned dependencies restrict the wheel search space. A declaration like `mediapipe==0.10.14` is evaluated against wheels published for that specific release (which ended at Python 3.12), rather than the wider matrix of newer releases.
 
 ### Jupyter notebooks
-In VS Code, imports inside `.ipynb` cells get the same diagnostics and quick fixes as `.py` files; IPython magics and shell escapes (`%pip`, `!ls`) are ignored. A notebook can only run in an environment that has `ipykernel`, so in projects with notebooks PyPilot adds `ipykernel>=7.0.1` to `.venv` whenever it sets up the environment or installs a package (as a dev dependency in uv projects), and warns when it is missing.
+In VS Code, imports inside `.ipynb` cells get the same diagnostics and quick fixes as `.py` files; IPython magics and shell escapes (`%pip`, `!ls`) are ignored. A notebook can only run in an environment that has `ipykernel`, so in projects with notebooks PyPilot adds `ipykernel>=6.31.0,<7` to `.venv` (ipykernel 7.x can make VS Code notebooks hang, and 7.0.0 cannot connect on Python 3.14) whenever it sets up the environment or installs a package (as a dev dependency in uv projects), and warns when it is missing.
 
 ### Installing several packages at once
 Select several unresolved imports and open the quick fixes: one action installs all of them in a single step, instead of one action per package. "Install all N missing packages in this file" (or "in this notebook") covers the rest of the document.
