@@ -5,7 +5,7 @@
 //! tested without spawning any processes. Every finding states the *why* — which
 //! package constrained the Python choice.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::platform::{Os, Platform};
 use crate::core::probe::Probes;
@@ -36,6 +36,9 @@ pub struct EnvSummary {
     /// Build tools on this machine, probed only when some dependency would
     /// compile from source. `None` means not probed: advise everything.
     pub toolchain: Option<Toolchain>,
+    /// The interpreter a broken venv is missing (see
+    /// [`crate::core::probe::missing_interpreter`]).
+    pub venv_missing_python: Option<PathBuf>,
 }
 
 impl EnvSummary {
@@ -43,6 +46,7 @@ impl EnvSummary {
         EnvSummary {
             has_venv: p.venv.is_some(),
             venv_python: p.venv.as_ref().and_then(|v| v.python),
+            venv_missing_python: p.venv.as_ref().and_then(|v| v.broken.clone()),
             uv_present: p.uv.is_some(),
             interpreters: p.interpreters.iter().map(|i| i.version).collect(),
             has_notebooks: crate::core::project::has_notebooks(workspace),
@@ -172,11 +176,27 @@ pub fn synthesize(
 ) -> (Option<PyVersion>, Vec<Finding>) {
     let mut findings = Vec::new();
 
+    // A venv whose Python is gone can't run anything, so every other verdict
+    // about it (its version, its kernel) is moot. Say that one thing, ahead of
+    // the Python-project gate: the `.venv` alone is reason enough.
+    let broken = env.venv_missing_python.as_ref().filter(|_| env.has_venv);
+    if let Some(missing) = broken {
+        findings.push(Finding {
+            severity: Severity::Error,
+            title: format!(
+                "The .venv is broken: its Python at {} no longer exists",
+                missing.display()
+            ),
+            detail: "The interpreter this environment was built on was moved or removed (a uv-managed Python upgraded or uninstalled, a system Python removed, or the project copied from another machine), so every command run through it fails. Rebuild the environment to recreate it on an installed Python.".to_string(),
+            fix: FixKind::SetupEnvironment,
+        });
+    }
+
     // Notebooks run on whatever kernel Jupyter can find, and an environment
     // without ipykernel is not one. Checked before the Python-project gate: a
     // `.venv` next to notebooks is reason enough, even with no manifest or
     // `.py` file. With no venv at all, the "no environment" finding covers it.
-    if env.has_venv && env.has_notebooks && !env.venv_has_ipykernel {
+    if env.has_venv && broken.is_none() && env.has_notebooks && !env.venv_has_ipykernel {
         findings.push(Finding {
             severity: Severity::Warning,
             title: "Notebooks can't use .venv yet".to_string(),
@@ -251,6 +271,12 @@ pub fn synthesize(
     }
 
     let target = compat.suggested_python();
+
+    // The broken-venv finding already asks for a rebuild, which lands on
+    // `target`; judging the dead interpreter's version would only add noise.
+    if broken.is_some() {
+        return (target, findings);
+    }
 
     // Determine the interpreter currently in effect: the venv's, else nothing.
     match env.venv_python {
@@ -682,6 +708,34 @@ mod tests {
             .find(|f| f.severity == Severity::Error)
             .unwrap();
         assert!(!f.detail.contains("compiling from source"));
+    }
+
+    #[test]
+    fn broken_venv_is_one_clear_rebuild_finding() {
+        // Its recorded Python (3.13) is unsupported and it has no kernel, but
+        // the only thing worth saying is that it can't run at all.
+        let compat = report(vec![analysis("mediapipe", &[9, 10, 11, 12])]);
+        let missing = PathBuf::from("/opt/uv/python/cpython-3.13.0/bin/python3.13");
+        let env = EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(13)),
+            has_notebooks: true,
+            venv_missing_python: Some(missing.clone()),
+            ..Default::default()
+        };
+        let (target, findings) = synthesize(&env, &python_project(), Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(12)));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.fix, FixKind::SetupEnvironment);
+        assert!(f.title.contains("broken"));
+        assert!(f.title.contains(&missing.display().to_string()));
+
+        // Reported even outside a recognised Python project.
+        let (_t, findings) = synthesize(&env, &ProjectDeps::default(), None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].fix, FixKind::SetupEnvironment);
     }
 
     #[test]
