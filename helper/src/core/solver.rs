@@ -73,11 +73,16 @@ pub async fn assess<S: MetadataSource>(
     let (target_python, mut findings) = synthesize(&env, &project, compat.as_ref());
     findings.extend(hardware.findings);
 
-    // A CPU torch on an NVIDIA machine, however it got there: checked against
-    // what is installed, not what is declared, since a later install can swap
-    // the CUDA build out without touching any manifest.
     if let Some(venv) = &probes.venv {
+        // A CPU torch on an NVIDIA machine, however it got there: checked
+        // against what is installed, not what is declared, since a later
+        // install can swap the CUDA build out without touching any manifest.
         findings.extend(crate::core::torch_gpu::static_check(&venv.path, settings).await);
+
+        // Installed packages whose metadata rules out an installed dependency,
+        // above all extensions built for NumPy 1.x sitting next to NumPy 2.
+        // Read off disk, so it costs file reads rather than a resolve.
+        findings.extend(crate::core::depcheck::check(&venv.path, venv.python));
     }
 
     // F3's hybrid confirmation: metadata explains which package would be the
