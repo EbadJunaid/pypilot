@@ -98,6 +98,18 @@ pub async fn run_with_mode<S: MetadataSource>(
         }
     }
 
+    // uv mode only builds a venv once it knows which Python to use, so a
+    // broken venv in a project with no version constraints would otherwise be
+    // left in place for `uv sync` to trip over. Rebuild it on the version it
+    // was made with (uv fetches it if it is gone), else the newest one here.
+    if summary.python.is_none() && mode != ResolvedMode::PurePip {
+        if let Some(venv) = broken_venv(&assessment, &venv_path) {
+            summary.python = venv
+                .python
+                .or_else(|| assessment.probes.interpreters.first().map(|i| i.version));
+        }
+    }
+
     match mode {
         ResolvedMode::UvFull => {
             run_uv_full(workspace, settings, &assessment, &venv_path, &mut summary).await
@@ -231,6 +243,18 @@ pub(crate) async fn ensure_ipykernel(
             &format!("{e} (notebooks will not see this environment until ipykernel is installed)"),
         ),
     }
+}
+
+/// The probed venv when it is the one at `venv_path` and its Python is gone.
+fn broken_venv<'a>(
+    assessment: &'a crate::core::Assessment,
+    venv_path: &Path,
+) -> Option<&'a crate::core::probe::VenvInfo> {
+    assessment
+        .probes
+        .venv
+        .as_ref()
+        .filter(|v| v.path == venv_path && v.broken.is_some())
 }
 
 /// The Python version a venv was created with, from its `pyvenv.cfg`.
@@ -556,6 +580,23 @@ async fn run_pip(
         &format!("{} ({})", interp.command, interp.version),
     );
 
+    // Unlike `uv venv --clear`, `python -m venv` reuses an existing directory,
+    // keeping the dead interpreter's links and site-packages (and failing on a
+    // dangling `bin/python`). Start a broken venv from scratch.
+    if broken_venv(assessment, venv_path).is_some() {
+        match std::fs::remove_dir_all(venv_path) {
+            Ok(()) => step_ok(
+                summary,
+                "remove broken venv",
+                &venv_path.display().to_string(),
+            ),
+            Err(e) => {
+                fail(summary, "remove broken venv", &e.to_string());
+                return;
+            }
+        }
+    }
+
     match pip::create_venv(&interp, venv_path, workspace).await {
         Ok(out) if out.success() => {
             step_ok(summary, "python -m venv", &venv_path.display().to_string())
@@ -661,4 +702,47 @@ fn fail(summary: &mut SetupSummary, name: &str, detail: &str) {
         ok: false,
         detail: detail.to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::probe::{Probes, VenvInfo};
+    use crate::core::Assessment;
+
+    fn assessment(venv: Option<VenvInfo>) -> Assessment {
+        Assessment {
+            probes: Probes {
+                venv,
+                ..Default::default()
+            },
+            project: Default::default(),
+            compat: None,
+            target_python: None,
+            findings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_the_rebuilt_venv_counts_as_broken() {
+        let path = PathBuf::from("ws").join(".venv");
+        let venv = |dir: &str, broken: Option<&str>| VenvInfo {
+            path: PathBuf::from("ws").join(dir),
+            python: Some(PyVersion::py3(12)),
+            broken: broken.map(PathBuf::from),
+        };
+
+        let a = assessment(Some(venv(".venv", Some("/gone/python3.12"))));
+        assert!(broken_venv(&a, &path).is_some());
+
+        // Healthy: setup leaves it to `uv venv --clear` / `python -m venv`.
+        let a = assessment(Some(venv(".venv", None)));
+        assert!(broken_venv(&a, &path).is_none());
+
+        // A broken `venv/` is not the `.venv` setup builds, so never deleted.
+        let a = assessment(Some(venv("venv", Some("/gone/python3.12"))));
+        assert!(broken_venv(&a, &path).is_none());
+
+        assert!(broken_venv(&assessment(None), &path).is_none());
+    }
 }
