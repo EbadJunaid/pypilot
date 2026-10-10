@@ -39,6 +39,11 @@ pub struct EnvSummary {
     /// The interpreter a broken venv is missing (see
     /// [`crate::core::probe::missing_interpreter`]).
     pub venv_missing_python: Option<PathBuf>,
+    /// Normalized names of dependencies whose source build a more specific
+    /// finding already explains (CUDA extensions, see
+    /// [`matrix::HardwareReport::explained_source_builds`]). They get no
+    /// generic "Will compile from source" finding on top.
+    pub explained_source_builds: Vec<String>,
 }
 
 impl EnvSummary {
@@ -57,6 +62,7 @@ impl EnvSummary {
                 )
             }),
             toolchain: None,
+            explained_source_builds: Vec::new(),
         }
     }
 }
@@ -80,6 +86,7 @@ pub async fn assess<S: MetadataSource>(
     let hardware = matrix::check(workspace, settings, &project.packages).await;
 
     let mut env = EnvSummary::from_probes(&probes, workspace);
+    env.explained_source_builds = hardware.explained_source_builds;
     // Probing compilers spawns processes, so only do it when a dependency
     // would actually build from source.
     if compat
@@ -246,7 +253,14 @@ pub fn synthesize(
     }
 
     // sdist-only compile warnings, with the toolchain advice for this OS.
+    // Skipped where a specific finding (a CUDA extension) already says it.
     for p in &compat.per_package {
+        if env
+            .explained_source_builds
+            .contains(&crate::core::project::normalize_name(&p.name))
+        {
+            continue;
+        }
         if let Some(kind) = p.sdist_kind() {
             findings.push(sdist_finding(p, kind, compat, env.toolchain));
         }
@@ -668,6 +682,46 @@ mod tests {
         assert_eq!(f.severity, Severity::Info);
         assert!(!f.detail.contains("Build Tools"));
         assert!(findings.iter().all(|f| f.severity == Severity::Info));
+    }
+
+    #[test]
+    fn cuda_extension_finding_replaces_the_generic_source_build_one() {
+        // What `assess` does: the CUDA-extension check runs first and names
+        // the packages it explained, and synthesize skips those.
+        let windows = Platform {
+            os: Os::Windows,
+            arch: crate::core::platform::Arch::X86_64,
+        };
+        let table = matrix::cuda_ext::ExtensionTable::load(matrix::CUDA_EXTENSIONS_JSON).unwrap();
+        let declared = vec![Requirement::any("flash_attn")];
+        let issues = matrix::cuda_ext::assess_project(&table, &declared, windows, &[]);
+        let env = EnvSummary {
+            explained_source_builds: issues
+                .iter()
+                .filter(|i| i.no_wheel)
+                .map(|i| crate::core::project::normalize_name(&i.package))
+                .collect(),
+            ..compat_venv(12)
+        };
+        let compat = report_on(
+            Os::Windows,
+            vec![sdist_pkg("flash-attn", false), sdist_pkg("oldlib", false)],
+        );
+        let (_t, mut findings) = synthesize(&env, &python_project(), Some(&compat));
+        findings.extend(issues.iter().map(matrix::cuda_ext::Issue::to_finding));
+
+        let about_flash_attn: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.title.contains("from source") && f.detail.contains("flash-attn"))
+            .collect();
+        assert_eq!(about_flash_attn.len(), 1, "{findings:#?}");
+        assert!(about_flash_attn[0].title.starts_with("flash-attn"));
+        assert!(about_flash_attn[0].detail.contains("nvcc"));
+
+        // A plain sdist-only package still gets the generic finding.
+        let generic = sdist_findings(&findings);
+        assert_eq!(generic.len(), 1);
+        assert!(generic[0].detail.contains("oldlib"));
     }
 
     #[test]
