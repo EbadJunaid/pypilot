@@ -32,9 +32,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::core::platform::Platform;
 use crate::core::{
-    guardian, imports, install, installed, probe, project, rescan, setup, solver, Assessment,
-    FixKind,
-    Severity,
+    guardian, imports, install, installed, probe, project, pyright, rescan, setup, solver,
+    Assessment, FixKind, Severity,
 };
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{MetadataSource, PyPiClient};
@@ -59,6 +58,14 @@ const BTN_INSTALL_UV: &str = "Install uv";
 const BTN_NO_THANKS: &str = "No thanks";
 const BTN_MODE_UV_PROJECT: &str = "uv project (pyproject.toml + lockfile)";
 const BTN_MODE_PIP_COMPAT: &str = "pip-compatible (requirements.txt, faster via uv)";
+
+const BTN_PIN_PYRIGHT: &str = "Point pyright at .venv";
+const BTN_NOT_NOW: &str = "Not now";
+
+/// Whether the client is Zed. Only Zed's own Python servers are pointed at
+/// the wrong environment by its toolchain selection, so only Zed users are
+/// offered the pyright pin; VS Code has its own interpreter picker.
+static CLIENT_IS_ZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How long the buffer must be idle before the guardian runs.
 const IDLE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -102,6 +109,11 @@ struct Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
         *self.shared.root.lock().await = workspace_root(&params).map(|w| project::project_root(&w));
+        let zed = params
+            .client_info
+            .as_ref()
+            .is_some_and(|c| is_zed_client(&c.name));
+        CLIENT_IS_ZED.store(zed, std::sync::atomic::Ordering::Relaxed);
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -509,6 +521,7 @@ async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, packages: 
                     ),
                 )
                 .await;
+            spawn_pyright_pin_offer(client, root);
             true
         }
         Ok(summary) => {
@@ -524,6 +537,65 @@ async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, packages: 
     };
     refresh_all_buffers(shared).await;
     ok
+}
+
+/// After PyPilot has built `.venv`, offer to point pyright and basedpyright at
+/// it (see [`pyright`]). Zed only, only when pyright is not configured yet, and
+/// never without the user's click. Spawned because the toast may stay
+/// unanswered, and the command that built the environment should finish now.
+fn spawn_pyright_pin_offer(client: &Client, root: &Path) {
+    if !CLIENT_IS_ZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(target) = pyright::pin_target(root) else {
+        return;
+    };
+    let client = client.clone();
+    let root = root.to_path_buf();
+    tokio::spawn(async move {
+        let file = match target {
+            pyright::PinTarget::Pyproject => "pyproject.toml ([tool.pyright])",
+            pyright::PinTarget::PyrightConfig => "a new pyrightconfig.json",
+        };
+        let chosen = client
+            .show_message_request(
+                MessageType::INFO,
+                format!(
+                    "PyPilot: if Zed's Python language server still reports installed packages \
+                     as unresolved, it is using another environment. Pin pyright/basedpyright \
+                     to .venv in {file}? This overrides Zed's toolchain selection for them."
+                ),
+                Some(vec![action(BTN_PIN_PYRIGHT), action(BTN_NOT_NOW)]),
+            )
+            .await
+            .ok()
+            .flatten();
+        if chosen.as_ref().map(|a| a.title.as_str()) != Some(BTN_PIN_PYRIGHT) {
+            return;
+        }
+        match pyright::write_pin(&root) {
+            Ok(path) => {
+                client
+                    .show_message(
+                        MessageType::INFO,
+                        format!(
+                            "PyPilot: wrote the .venv pin to {}. Restart the Python language \
+                             server if it does not pick it up.",
+                            path.display()
+                        ),
+                    )
+                    .await
+            }
+            Err(e) => {
+                client
+                    .show_message(
+                        MessageType::WARNING,
+                        format!("PyPilot: left pyright config unchanged. {e}"),
+                    )
+                    .await
+            }
+        }
+    });
 }
 
 async fn report_failed_step(client: &Client, summary: &setup::SetupSummary) {
@@ -746,6 +818,7 @@ async fn run_fix(client: &Client, source: &PyPiClient, root: &Path) -> bool {
                     ),
                 )
                 .await;
+            spawn_pyright_pin_offer(client, root);
             true
         }
         Ok(summary) => {
@@ -1018,6 +1091,12 @@ async fn package_check_markdown(source: &PyPiClient, a: &Assessment, package: &s
     s
 }
 
+/// Zed names itself after its release channel: `Zed`, `Zed Preview`,
+/// `Zed Nightly`, `Zed Dev`.
+fn is_zed_client(name: &str) -> bool {
+    name == "Zed" || name.starts_with("Zed ")
+}
+
 /// Workspace root from the initialize params, folders first.
 fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     if let Some(folders) = &params.workspace_folders {
@@ -1113,6 +1192,16 @@ mod tests {
         let untitled =
             Url::parse("vscode-notebook-cell:Untitled-1.ipynb#W0sdW50aXRsZWQ%3D").unwrap();
         assert_eq!(notebook_url(&untitled), None);
+    }
+
+    #[test]
+    fn every_zed_release_channel_counts_as_zed() {
+        for name in ["Zed", "Zed Preview", "Zed Nightly", "Zed Dev"] {
+            assert!(is_zed_client(name), "{name}");
+        }
+        for name in ["Visual Studio Code", "Zedd", "neovim"] {
+            assert!(!is_zed_client(name), "{name}");
+        }
     }
 
     #[test]
