@@ -1,0 +1,42 @@
+name: Data freshness
+
+# Weekly drift check of helper/data/*.json against PyPI and download.pytorch.org.
+# Stale tables fail the run (GitHub emails the owner); network trouble upstream
+# only leaves a warning, since it says nothing about the tables themselves.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for the schema check against the last release
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Check data tables
+        shell: bash
+        run: |
+          set +e
+          python scripts/check_data.py
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "Data tables are current." ;;
+            1) echo "::error title=Stale data tables::Run scripts/check_data.py locally and update helper/data (see AGENTS.md)."
+               exit 1 ;;
+            2) echo "::warning title=Upstream unreachable::Some checks could not reach PyPI or download.pytorch.org; retry later." ;;
+            *) echo "::error::check_data.py exited with $code"
+               exit "$code" ;;
+          esac
