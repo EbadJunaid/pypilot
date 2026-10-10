@@ -7,6 +7,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::process::Command;
 
@@ -50,7 +51,38 @@ where
     S: AsRef<OsStr>,
     A: AsRef<OsStr>,
 {
-    let mut cmd = Command::new(program.as_ref());
+    let cmd = build(program.as_ref(), args, cwd);
+    collect(cmd, program.as_ref()).await
+}
+
+/// [`run`], but give up after `limit`. The child is killed rather than left
+/// running, so a hung probe (a GPU driver stuck initializing, say) cannot
+/// outlive the step that asked for it. A timeout is an `Err`, like a failed
+/// spawn: there is no exit status to report.
+pub async fn run_with_timeout<S, A>(
+    program: S,
+    args: &[A],
+    cwd: Option<&Path>,
+    limit: Duration,
+) -> crate::Result<Output>
+where
+    S: AsRef<OsStr>,
+    A: AsRef<OsStr>,
+{
+    let mut cmd = build(program.as_ref(), args, cwd);
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(limit, collect(cmd, program.as_ref())).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "`{}` did not finish within {}s",
+            program.as_ref().to_string_lossy(),
+            limit.as_secs()
+        ),
+    }
+}
+
+fn build<A: AsRef<OsStr>>(program: &OsStr, args: &[A], cwd: Option<&Path>) -> Command {
+    let mut cmd = Command::new(program);
     for a in args {
         cmd.arg(a.as_ref());
     }
@@ -64,13 +96,14 @@ where
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    cmd
+}
 
-    let out = cmd.output().await.map_err(|e| {
-        anyhow::anyhow!(
-            "failed to spawn `{}`: {e}",
-            program.as_ref().to_string_lossy()
-        )
-    })?;
+async fn collect(mut cmd: Command, program: &OsStr) -> crate::Result<Output> {
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", program.to_string_lossy()))?;
 
     Ok(Output {
         status: out.status.code(),
