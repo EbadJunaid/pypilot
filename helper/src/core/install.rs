@@ -253,6 +253,12 @@ pub async fn install_packages(
     if !asked_for_ipykernel {
         setup::ensure_ipykernel(workspace, settings, mode, &mut summary).await;
     }
+    let installed_torch = packages
+        .iter()
+        .any(|p| crate::core::project::requirement_name(p).as_deref() == Some("torch"));
+    if installed_torch {
+        setup::verify_gpu(workspace, &mut summary).await;
+    }
 
     Ok(summary)
 }

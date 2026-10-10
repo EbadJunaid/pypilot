@@ -109,7 +109,38 @@ pub async fn run_with_mode<S: MetadataSource>(
     }
 
     ensure_ipykernel(workspace, settings, mode, &mut summary).await;
+    if assessment
+        .project
+        .packages
+        .iter()
+        .any(|r| r.name == "torch")
+    {
+        verify_gpu(workspace, &mut summary).await;
+    }
     Ok(summary)
+}
+
+/// Step name for the post-install torch GPU self-test.
+const GPU_CHECK_STEP: &str = "GPU check";
+
+/// Confirm the torch PyPilot just installed can actually use the NVIDIA GPU.
+///
+/// Called right after an install that included torch, which is the moment a
+/// CPU build or an unsupported CUDA build is cheapest to notice. Non-fatal:
+/// torch did install, so a mismatch is recorded as a failed step that says
+/// why, without clearing [`SetupSummary::ok`]. Skipped when the run already
+/// failed, when there is no `.venv` or torch in it, and on machines without
+/// an NVIDIA GPU.
+pub(crate) async fn verify_gpu(workspace: &Path, summary: &mut SetupSummary) {
+    let venv = workspace.join(".venv");
+    if summary.failed() || !venv.is_dir() || !installed::scan(&venv).contains("torch") {
+        return;
+    }
+    match crate::core::torch_gpu::self_test(&venv, workspace).await {
+        Some(Ok(detail)) => step_ok(summary, GPU_CHECK_STEP, &detail),
+        Some(Err(why)) => soft_fail(summary, GPU_CHECK_STEP, &why),
+        None => {}
+    }
 }
 
 /// Step name for the notebook kernel install, shared by setup and install.
