@@ -142,7 +142,8 @@ pub(crate) async fn ensure_ipykernel(
     {
         return;
     }
-    // One argv element; the `>=` floor also upgrades a too-old ipykernel.
+    // One argv element; the range also replaces an ipykernel that cannot
+    // connect on this Python (see `installed::IPYKERNEL_REQUIREMENT`).
     let packages = vec![installed::IPYKERNEL_REQUIREMENT.to_string()];
 
     let result = match mode {

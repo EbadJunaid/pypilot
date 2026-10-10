@@ -154,7 +154,7 @@ pub fn synthesize(
         findings.push(Finding {
             severity: Severity::Warning,
             title: "Notebooks can't use .venv yet".to_string(),
-            detail: "This project has Jupyter notebooks, but its environment has no usable ipykernel (7.0.1+ is needed on Python 3.14), so VS Code and Jupyter can't offer it as a kernel and fall back to another Python where the project's packages are missing. Set up the environment to install ipykernel.".to_string(),
+            detail: "This project has Jupyter notebooks, but its environment has no usable ipykernel (on Python 3.14, ipykernel 7.0.0 and releases before 6.30.1 cannot connect), so VS Code and Jupyter can't offer it as a kernel and fall back to another Python where the project's packages are missing. Set up the environment to install ipykernel.".to_string(),
             fix: FixKind::SetupEnvironment,
         });
     }

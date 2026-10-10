@@ -37,28 +37,51 @@ impl Installed {
 
 /// The requirement PyPilot installs so notebooks can use the venv as a kernel.
 ///
-/// The floor matters: ipykernel before 7.0.1 fails to connect kernels on
-/// Python 3.14 (notably on Windows), so a bare `ipykernel` could resolve to a
-/// cached or pinned release that installs fine and still leaves the notebook
-/// unable to start.
-pub const IPYKERNEL_REQUIREMENT: &str = "ipykernel>=7.0.1";
+/// Pinned to the 6.x line on purpose, because each half of the range avoids a
+/// known failure:
+///
+/// - `<7`: on ipykernel 7.x (reported on 7.1.0 and 7.2.0) VS Code notebooks
+///   can hang with cells stuck "pending", while 6.31.0 runs them; no 7.x
+///   release is confirmed to fix it, and the maintainers' advice is to pin
+///   below 7. <https://github.com/microsoft/vscode-jupyter/issues/17228>
+/// - `>=6.31.0`: the newest 6.x, released after Python 3.14 and tested on it.
+///   The Python 3.14 "kernel won't connect" failure was specific to 7.0.0
+///   (its new shell-channel thread overrode `Thread._context`, which 3.14
+///   uses); 6.30.1+ is unaffected and 7.0.1 fixed it.
+///   <https://github.com/ipython/ipykernel/issues/1445>
+///
+/// The floor also matters because a bare `ipykernel` could resolve to a cached
+/// or pinned release that installs fine and still leaves the notebook unable to
+/// start.
+pub const IPYKERNEL_REQUIREMENT: &str = "ipykernel>=6.31.0,<7";
 
 /// Can Jupyter / VS Code use this venv as a notebook kernel?
 ///
-/// True when `ipykernel` is installed, except that on Python 3.14+ a release
-/// older than 7.0.1 counts as missing (it cannot connect there). An unknown
-/// version or unknown Python is given the benefit of the doubt, so PyPilot
-/// never nags about something it cannot verify.
+/// True when `ipykernel` is installed, except that on Python 3.14+ the
+/// releases known not to connect there count as missing, so setup replaces
+/// them: 7.0.0 and its pre-releases (fixed in 7.0.1, see
+/// [`IPYKERNEL_REQUIREMENT`]) and anything before 6.30.1, the oldest release
+/// reported to work on 3.14.
+///
+/// A later 7.x is deliberately left alone even though VS Code may hang on it:
+/// that hang is setup-dependent, many users run 7.x fine, and the version may
+/// be required by the project, so downgrading it behind the user's back could
+/// break more than it fixes. An unknown version or unknown Python is given the
+/// benefit of the doubt, so PyPilot never nags about something it cannot
+/// verify.
 pub fn has_usable_ipykernel(installed: &Installed, python: Option<PyVersion>) -> bool {
     if !installed.contains("ipykernel") {
         return false;
     }
-    let needs_new = python.is_some_and(|p| p >= PyVersion::py3(14));
-    if !needs_new {
+    if !python.is_some_and(|p| p >= PyVersion::py3(14)) {
         return true;
     }
     match installed.version_of("ipykernel") {
-        Some(v) => release_tuple(&v) >= (7, 0, 1),
+        // Pre-release suffixes are cut, so `7.0.0rc1` lands in the bad band.
+        Some(v) => {
+            let release = release_tuple(&v);
+            release >= (7, 0, 1) || ((6, 30, 1)..(7, 0, 0)).contains(&release)
+        }
         None => true,
     }
 }
@@ -204,25 +227,43 @@ mod tests {
     }
 
     #[test]
-    fn old_ipykernel_is_missing_only_on_python_314_and_later() {
-        let old = with_ipykernel(Some("6.29.5"));
-        let new = with_ipykernel(Some("7.0.1"));
+    fn broken_ipykernel_is_missing_only_on_python_314_and_later() {
+        let ancient = with_ipykernel(Some("6.29.5"));
+        let seven_oh = with_ipykernel(Some("7.0.0"));
         let py313 = Some(PyVersion::py3(13));
         let py314 = Some(PyVersion::py3(14));
 
-        assert!(has_usable_ipykernel(&old, py313));
-        assert!(!has_usable_ipykernel(&old, py314));
+        // Before 3.14 any installed ipykernel is accepted.
+        assert!(has_usable_ipykernel(&ancient, py313));
+        assert!(has_usable_ipykernel(&seven_oh, py313));
+        // On 3.14: too old, and the 7.0.0 line, cannot connect.
+        assert!(!has_usable_ipykernel(&ancient, py314));
+        assert!(!has_usable_ipykernel(&seven_oh, py314));
         assert!(!has_usable_ipykernel(
             &with_ipykernel(Some("7.0.0rc1")),
             py314
         ));
-        assert!(has_usable_ipykernel(&new, py314));
+        // 6.30.1+ on the 6.x line works on 3.14, as does 7.0.1+.
+        assert!(has_usable_ipykernel(&with_ipykernel(Some("6.30.1")), py314));
+        assert!(has_usable_ipykernel(&with_ipykernel(Some("6.31.0")), py314));
+        assert!(has_usable_ipykernel(&with_ipykernel(Some("7.0.1")), py314));
         assert!(has_usable_ipykernel(&with_ipykernel(Some("7.10")), py314));
         // Unverifiable: don't nag.
-        assert!(has_usable_ipykernel(&old, None));
+        assert!(has_usable_ipykernel(&ancient, None));
         assert!(has_usable_ipykernel(&with_ipykernel(None), py314));
         // Not installed at all.
         assert!(!has_usable_ipykernel(&Installed::default(), py313));
+    }
+
+    #[test]
+    fn installed_requirement_accepts_only_a_usable_release() {
+        // Whatever the requirement installs must pass the usability check on
+        // every Python, or setup would reinstall it on every run.
+        assert_eq!(IPYKERNEL_REQUIREMENT, "ipykernel>=6.31.0,<7");
+        let floor = with_ipykernel(Some("6.31.0"));
+        for minor in [9, 13, 14, 15] {
+            assert!(has_usable_ipykernel(&floor, Some(PyVersion::py3(minor))));
+        }
     }
 
     #[test]
