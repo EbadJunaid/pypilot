@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::bail;
 
 use crate::core::setup::{self, SetupSummary, Step};
-use crate::core::{pip, uv};
+use crate::core::{pip, torch_index, uv};
 use crate::matrix;
 use crate::pypi::pyversion::PyVersion;
 use crate::settings::{ResolvedMode, Settings};
@@ -149,8 +149,37 @@ pub async fn install_packages(
             // which pulls existing entries into the new pyproject before adding
             // the requested packages.
             let pyproject_was_new = !has_pyproject;
+            let pyproject = workspace.join("pyproject.toml");
             for (i, batch) in batches.iter().enumerate() {
-                let index_url = batch.index_url.as_deref();
+                let mut index_url = batch.index_url.as_deref();
+                // Record a PyTorch index in the manifest instead of passing it
+                // on the command line, so a later `uv sync` keeps the CUDA
+                // build. If the manifest cannot be edited, the command-line
+                // index still gets this install right.
+                let pinned = match torch_index::pin_file(&pyproject, index_url, &batch.packages) {
+                    Ok(pinned) => pinned,
+                    // Only worth mentioning for a batch that has an index to
+                    // record; a plain numpy add would warn about nothing.
+                    Err(e) if index_url.is_some() => {
+                        let detail = format!(
+                            "(warning) pyproject.toml left as is ({e}), so a later `uv sync` may swap the build"
+                        );
+                        push(&mut summary, "record PyTorch index", true, &detail);
+                        torch_index::PinFile::NotApplicable
+                    }
+                    Err(_) => torch_index::PinFile::NotApplicable,
+                };
+                if pinned.is_pinned() {
+                    index_url = None;
+                }
+                if matches!(pinned, torch_index::PinFile::Changed { .. }) {
+                    push(
+                        &mut summary,
+                        "record PyTorch index",
+                        true,
+                        "pyproject.toml routes torch to the matched build, so `uv sync` keeps it",
+                    );
+                }
                 let step = format!("uv add {}", batch.packages.join(" "));
                 let result = if pyproject_was_new && i == 0 {
                     uv::add_with_requirements_migration(
@@ -164,6 +193,7 @@ pub async fn install_packages(
                     uv::add(&uv_info, &batch.packages, index_url, workspace).await
                 };
 
+                let ok = matches!(&result, Ok(out) if out.success());
                 match result {
                     Ok(out) if out.success() => push(
                         &mut summary,
@@ -173,6 +203,18 @@ pub async fn install_packages(
                     ),
                     Ok(out) => push(&mut summary, &step, false, out.stderr.trim()),
                     Err(e) => push(&mut summary, &step, false, &e.to_string()),
+                }
+                // A failed add must not leave the project routed to an index
+                // it never installed from.
+                if let (false, torch_index::PinFile::Changed { original }) = (ok, &pinned) {
+                    if let Err(e) = std::fs::write(&pyproject, original) {
+                        push(
+                            &mut summary,
+                            "restore pyproject.toml",
+                            false,
+                            &e.to_string(),
+                        );
+                    }
                 }
             }
         }
