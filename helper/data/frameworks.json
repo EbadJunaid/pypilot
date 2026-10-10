@@ -1,5 +1,5 @@
 {
-  "_comment": "Only what F3 cannot already derive from PyPI: which CUDA build variants a torch release ships (and their index URL), and the minimum CUDA runtime a tensorflow release needs. Python-version support per release is NOT duplicated here -- it comes from the same PyPI wheel-tag analysis F3 already does, resolving 'torch' or 'tensorflow' as an ordinary pinned dependency. Real data from pytorch.org/get-started/previous-versions and tensorflow.org/install/source#gpu; the refresh job (F7) keeps this current between releases of PyPilot itself.",
+  "_comment": "Only what F3 cannot already derive from PyPI: which CUDA build variants a torch release ships (and their index URL), and the minimum CUDA runtime a tensorflow release needs. Python-version support per release is NOT duplicated here -- it comes from the same PyPI wheel-tag analysis F3 already does, resolving 'torch' or 'tensorflow' as an ordinary pinned dependency. Real data from pytorch.org/get-started/previous-versions and tensorflow.org/install/source#gpu; the refresh job (F7) keeps this current between releases of PyPilot itself. Torch rows list only the CUDA builds published for BOTH win_amd64 and manylinux x86_64, verified per index at download.pytorch.org/whl/<tag>/torch/: cu129 has been Linux-only since 2.9.1, e.g. 2.12.1 and 2.13.0, so it is omitted.",
   "schema_version": 2,
   "torch": {
     "pypi_name": "torch",
@@ -19,7 +19,10 @@
       { "version": "2.10.0", "cuda_builds": ["cu126", "cu128", "cu130"] },
       { "version": "2.11.0", "cuda_builds": ["cu126", "cu128", "cu130"] },
       { "version": "2.12.0", "cuda_builds": ["cu126", "cu130", "cu132"] },
-      { "version": "2.12.1", "cuda_builds": ["cu126", "cu130", "cu132"] }
+      { "version": "2.12.1", "cuda_builds": ["cu126", "cu130", "cu132"] },
+      { "version": "2.13.0", "cuda_builds": ["cu126", "cu130", "cu132"] },
+      { "version": "2.14.0", "cuda_builds": ["cu126", "cu130", "cu132"] },
+      { "version": "2.14.1", "cuda_builds": ["cu126", "cu130", "cu132"] }
     ]
   },
   "tensorflow": {
