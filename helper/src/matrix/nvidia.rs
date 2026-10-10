@@ -245,13 +245,44 @@ mod tests {
         let t = table();
         let s = t.support_for("999.00", Os::Linux).unwrap();
         assert!(s.exceeds_known_table);
-        // Still gets the newest known floor as a confirmed-supported answer.
+        // Still gets the newest known floor as a confirmed-supported answer:
+        // whatever the table's newest row is, so this holds across refreshes.
+        let newest = CudaVersion::parse(&t.rows.last().unwrap().cuda).unwrap();
+        assert_eq!(s.max_known, newest);
+    }
+
+    #[test]
+    fn r595_windows_driver_resolves_to_cuda_13_2() {
+        // An RTX A5000 Laptop on driver 596.86, which nvidia-smi reports as
+        // "CUDA Version: 13.2", was capped at 12.9 when the table stopped
+        // there, so a cu126 torch was picked over cu130.
+        let t = table();
+        let s = t.support_for("596.86", Os::Windows).unwrap();
         assert_eq!(
             s.max_known,
             CudaVersion {
-                major: 12,
-                minor: 9
+                major: 13,
+                minor: 2
             }
+        );
+        assert!(!s.exceeds_known_table);
+        assert_eq!(s.min_driver_for_max, "595.97");
+    }
+
+    #[test]
+    fn cuda_13_floors_differ_per_os() {
+        let t = table();
+        let cu130 = CudaVersion {
+            major: 13,
+            minor: 0,
+        };
+        assert_eq!(
+            t.min_driver_for(cu130, Os::Linux).as_deref(),
+            Some("580.65.06")
+        );
+        assert_eq!(
+            t.min_driver_for(cu130, Os::Windows).as_deref(),
+            Some("580.88")
         );
     }
 }
