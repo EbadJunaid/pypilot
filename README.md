@@ -134,6 +134,8 @@ cargo build -p pypilot-zed --target wasm32-wasip2 --release
 
 Tests run offline against recorded PyPI fixtures and fixed Linux x86-64 target tags.
 
+`python scripts/check_data.py` reports whether the bundled tables in `helper/data/` have fallen behind PyPI, the PyTorch wheel indexes and NVIDIA's driver table. Run it before changing code and see [AGENTS.md](AGENTS.md) for how to update them.
+
 ## License
 
 PyPilot uses two licenses corresponding to its components:
