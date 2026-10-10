@@ -937,6 +937,7 @@ mod tests {
         Accelerator::Nvidia {
             name: "RTX 4070".into(),
             driver_version: "560.94".into(),
+            compute_cap: Some("8.9".into()),
         }
     }
 
