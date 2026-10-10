@@ -137,6 +137,18 @@ pub fn to_diagnostic(finding: &Finding) -> Diagnostic {
             )
         }
 
+        // No install offer: a plain install is exactly what would fail or
+        // replace torch. The message says what to run or use instead.
+        Problem::CudaExtension { blocking, message } => (
+            if *blocking {
+                DiagnosticSeverity::ERROR
+            } else {
+                DiagnosticSeverity::WARNING
+            },
+            message.clone(),
+            FixAction::None,
+        ),
+
         // Deliberately actionless. Offering to install a name PyPI does not know
         // is how a typo becomes a supply chain incident.
         Problem::NotOnPyPi => (
@@ -592,6 +604,31 @@ mod tests {
             code_actions(&[d]).is_empty(),
             "never offer to install a name PyPI does not have"
         );
+    }
+
+    #[test]
+    fn cuda_extensions_explain_instead_of_offering_an_install() {
+        let warn = to_diagnostic(&finding(
+            Problem::CudaExtension {
+                blocking: false,
+                message: "flash-attn is published on PyPI only as source.".into(),
+            },
+            "flash-attn",
+            false,
+        ));
+        assert_eq!(warn.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(warn.message.contains("only as source"));
+        assert!(code_actions(&[warn]).is_empty());
+
+        let blocking = to_diagnostic(&finding(
+            Problem::CudaExtension {
+                blocking: true,
+                message: "macOS has no CUDA.".into(),
+            },
+            "flash-attn",
+            false,
+        ));
+        assert_eq!(blocking.severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::core::modules;
 use crate::core::platform::Platform;
 use crate::core::stdlib;
 use crate::matrix;
+use crate::matrix::cuda_ext::{self, ExtensionTable};
 use crate::pypi::metadata::PackageAnalysis;
 use crate::pypi::pyversion::{PyVersion, PyVersionSet};
 use crate::pypi::MetadataSource;
@@ -55,6 +56,16 @@ pub enum Problem {
         installed_version: Option<String>,
         /// What the package does expose, to point at the replacement.
         available: Vec<String>,
+    },
+    /// A CUDA extension (flash-attn, xformers, ...) that a plain install
+    /// would get wrong here: no wheel for this platform, a source build that
+    /// needs torch, or a release built for a different torch than the venv's.
+    /// Replaces the install offer, since that offer is what would fail.
+    CudaExtension {
+        /// It cannot work on this machine at all.
+        blocking: bool,
+        /// Why, and what to do instead.
+        message: String,
     },
 }
 
@@ -208,13 +219,43 @@ pub async fn analyze_buffer_in<S: MetadataSource>(
         file_target,
     };
 
+    let extensions = matrix::cuda_extensions();
+    let torch = installed.version_of("torch");
+
     candidates
         .into_iter()
         .map(|(import, package, renamed)| {
             let analysis = analyses.get(&package).and_then(|a| a.as_ref());
-            classify(import, package, renamed, analysis, &ctx)
+            let finding = classify(import, package, renamed, analysis, &ctx);
+            flag_cuda_extension(finding, extensions, platform, torch.as_deref())
         })
         .collect()
+}
+
+/// Turn an install offer for a CUDA extension into the reason it would go
+/// wrong, when there is one. Other problems (an interpreter conflict, a name
+/// PyPI does not know) are left alone: they come first either way.
+pub fn flag_cuda_extension(
+    mut finding: Finding,
+    extensions: &ExtensionTable,
+    platform: Platform,
+    installed_torch: Option<&str>,
+) -> Finding {
+    if !matches!(
+        finding.problem,
+        Problem::NotInstalled | Problem::NoEnvironment { .. }
+    ) {
+        return finding;
+    }
+    if let Some(issue) =
+        cuda_ext::check_import(extensions, &finding.package, platform, installed_torch)
+    {
+        finding.problem = Problem::CudaExtension {
+            blocking: issue.blocking,
+            message: issue.detail,
+        };
+    }
+    finding
 }
 
 /// Check attribute accesses against what the installed packages actually expose.
@@ -420,6 +461,49 @@ mod tests {
         assert!(!local_modules(&ws, None).contains("helpers"));
         assert!(local_modules(&ws, Some(&notebooks)).contains("helpers"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn cuda_extension_install_offers_carry_the_reason_instead() {
+        use crate::core::platform::{Arch, Os};
+        let windows = Platform {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        };
+        let linux = Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        let table = ExtensionTable::load(matrix::CUDA_EXTENSIONS_JSON).unwrap();
+        let missing = |package: &str| Finding {
+            import: import_of(package),
+            package: package.into(),
+            renamed: false,
+            problem: Problem::NotInstalled,
+        };
+
+        let f = flag_cuda_extension(missing("flash_attn"), &table, windows, None);
+        let Problem::CudaExtension { blocking, message } = f.problem else {
+            panic!("expected a CUDA extension warning, got {:?}", f.problem);
+        };
+        assert!(!blocking);
+        assert!(message.contains("sdpa"));
+
+        // xformers next to an older torch: installing the latest replaces it.
+        let f = flag_cuda_extension(missing("xformers"), &table, linux, Some("2.7.0"));
+        assert!(matches!(f.problem, Problem::CudaExtension { .. }));
+        let f = flag_cuda_extension(missing("xformers"), &table, linux, Some("2.11.0"));
+        assert_eq!(f.problem, Problem::NotInstalled);
+
+        // Ordinary packages and other problems are untouched.
+        let f = flag_cuda_extension(missing("numpy"), &table, windows, None);
+        assert_eq!(f.problem, Problem::NotInstalled);
+        let not_on_pypi = Finding {
+            problem: Problem::NotOnPyPi,
+            ..missing("flash_attn")
+        };
+        let f = flag_cuda_extension(not_on_pypi, &table, windows, None);
+        assert_eq!(f.problem, Problem::NotOnPyPi);
     }
 
     #[test]
