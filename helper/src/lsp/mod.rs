@@ -32,7 +32,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::core::platform::Platform;
 use crate::core::{
-    guardian, imports, install, installed, probe, rescan, setup, solver, Assessment, FixKind,
+    guardian, imports, install, installed, probe, project, rescan, setup, solver, Assessment,
+    FixKind,
     Severity,
 };
 use crate::pypi::pyversion::PyVersion;
@@ -78,6 +79,8 @@ struct Document {
 /// State shared between request handlers and spawned background tasks.
 struct Shared {
     client: Client,
+    /// The project PyPilot sets up: the worktree itself, or its one nested
+    /// Python project (see [`project::project_root`]).
     root: Mutex<Option<PathBuf>>,
     /// Open buffers, by URI.
     documents: Mutex<HashMap<Url, Document>>,
@@ -98,7 +101,7 @@ struct Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> RpcResult<InitializeResult> {
-        *self.shared.root.lock().await = workspace_root(&params);
+        *self.shared.root.lock().await = workspace_root(&params).map(|w| project::project_root(&w));
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {

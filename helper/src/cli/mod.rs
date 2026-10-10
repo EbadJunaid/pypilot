@@ -18,7 +18,9 @@ use crate::settings::Settings;
 
 /// Dispatch a CLI mode.
 pub async fn dispatch(mode: &str, args: &[String]) -> crate::Result<()> {
-    let workspace = workspace_from_args(args);
+    // The same project the editor works on, so a task run from a worktree whose
+    // Python code lives in one subfolder sets up that subfolder's `.venv`.
+    let workspace = crate::core::project::project_root(&workspace_from_args(args));
     let settings = Settings::load(&workspace);
     let source = PyPiClient::new();
 

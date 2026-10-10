@@ -516,6 +516,89 @@ pub fn has_notebooks(workspace: &Path) -> bool {
     walk(workspace, NOTEBOOK_SEARCH_DEPTH)
 }
 
+/// Manifests that mark a directory as the root of a Python project, the place
+/// its `.venv` belongs. `environment.yml` counts at the workspace root, where
+/// [`scan`] reads it, but is too common in non-Python subfolders to count below.
+const PROJECT_MANIFESTS: &[&str] = &["pyproject.toml", "requirements.txt"];
+
+/// How deep [`project_root`] looks for a nested project when the workspace root
+/// has none: `backend/` and `services/api/` are covered, deeper layouts are rare
+/// enough to leave to opening that folder directly.
+const NESTED_PROJECT_DEPTH: usize = 2;
+
+/// Files that make the workspace root a Python project without making a
+/// subfolder one: a root `setup.py` next to `docs/requirements.txt` is still a
+/// root project.
+const ROOT_ONLY_MARKERS: &[&str] = &["environment.yml", "setup.py", "setup.cfg", "Pipfile"];
+
+fn has_manifest(dir: &Path) -> bool {
+    PROJECT_MANIFESTS.iter().any(|m| dir.join(m).is_file())
+}
+
+/// The directory PyPilot should treat as the project for a workspace.
+///
+/// Normally that is the workspace itself. When the workspace root has no Python
+/// of its own (no manifest, no legacy `setup.py`/`setup.cfg`/`Pipfile`, no `.py`
+/// file or notebook) but exactly one subfolder has a `pyproject.toml` or
+/// `requirements.txt`, as when a repo keeps its Python code in `backend/`, that
+/// subfolder is the project: its `.venv` is the one to set up, install into and
+/// check imports against. Several nested projects are ambiguous, so the
+/// workspace root stays in charge then.
+pub fn project_root(workspace: &Path) -> PathBuf {
+    let own_python = has_manifest(workspace)
+        || ROOT_ONLY_MARKERS
+            .iter()
+            .any(|m| workspace.join(m).is_file())
+        || std::fs::read_dir(workspace).is_ok_and(|rd| {
+            rd.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x == "py" || x == "ipynb")
+            })
+        });
+    if own_python {
+        return workspace.to_path_buf();
+    }
+
+    fn walk(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut subdirs: Vec<PathBuf> = rd
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with('.')
+                    && !NOTEBOOK_SKIP_DIRS.iter().any(|s| name == *s)
+                    && !e.path().join("pyvenv.cfg").is_file()
+            })
+            .map(|e| e.path())
+            .collect();
+        subdirs.sort();
+        for sub in subdirs {
+            if has_manifest(&sub) {
+                // A project's own subfolders belong to it, not to a sibling.
+                found.push(sub);
+            } else if depth > 1 {
+                walk(&sub, depth - 1, found);
+            }
+            // Two is already ambiguous; no need to look further.
+            if found.len() > 1 {
+                return;
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    walk(workspace, NESTED_PROJECT_DEPTH, &mut found);
+    match found.as_slice() {
+        [only] => only.clone(),
+        _ => workspace.to_path_buf(),
+    }
+}
+
 fn dedupe(mut reqs: Vec<Requirement>) -> Vec<Requirement> {
     reqs.retain(|r| !r.name.is_empty());
     reqs.sort();
@@ -814,6 +897,82 @@ requests = "^2.31"
         assert!(deps.is_python_project());
         assert!(deps.packages.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh, empty directory under the temp dir for one test.
+    fn fresh_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn a_workspace_with_its_own_manifest_is_its_own_project() {
+        let ws = fresh_dir("pypilot-root-own-manifest");
+        touch(&ws.join("pyproject.toml"));
+        // Even with a nested project next to it.
+        touch(&ws.join("tools/requirements.txt"));
+        assert_eq!(project_root(&ws), ws);
+
+        let ws2 = fresh_dir("pypilot-root-own-requirements");
+        touch(&ws2.join("requirements.txt"));
+        touch(&ws2.join("backend/pyproject.toml"));
+        assert_eq!(project_root(&ws2), ws2);
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&ws2);
+    }
+
+    #[test]
+    fn a_single_nested_project_becomes_the_project() {
+        let ws = fresh_dir("pypilot-root-single-nested");
+        touch(&ws.join("README.md"));
+        touch(&ws.join("backend/pyproject.toml"));
+        // Its own subfolders do not make it ambiguous.
+        touch(&ws.join("backend/docs/requirements.txt"));
+        assert_eq!(project_root(&ws), ws.join("backend"));
+
+        let deeper = fresh_dir("pypilot-root-depth-two");
+        touch(&deeper.join("services/api/requirements.txt"));
+        assert_eq!(project_root(&deeper), deeper.join("services/api"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&deeper);
+    }
+
+    #[test]
+    fn several_nested_projects_or_none_keep_the_workspace() {
+        let ws = fresh_dir("pypilot-root-ambiguous");
+        touch(&ws.join("api/pyproject.toml"));
+        touch(&ws.join("worker/pyproject.toml"));
+        assert_eq!(project_root(&ws), ws);
+
+        let empty = fresh_dir("pypilot-root-none");
+        assert_eq!(project_root(&empty), empty);
+
+        // Python at the root keeps the root, whatever a subfolder declares.
+        let scripts = fresh_dir("pypilot-root-scripts");
+        touch(&scripts.join("main.py"));
+        touch(&scripts.join("backend/pyproject.toml"));
+        assert_eq!(project_root(&scripts), scripts);
+        let legacy = fresh_dir("pypilot-root-setup-py");
+        touch(&legacy.join("setup.py"));
+        touch(&legacy.join("docs/requirements.txt"));
+        assert_eq!(project_root(&legacy), legacy);
+
+        // Manifests inside environments, hidden or too-deep folders don't count.
+        let hidden = fresh_dir("pypilot-root-hidden");
+        touch(&hidden.join(".venv/lib/pyproject.toml"));
+        touch(&hidden.join("node_modules/x/requirements.txt"));
+        touch(&hidden.join("a/b/c/pyproject.toml"));
+        assert_eq!(project_root(&hidden), hidden);
+        for d in [ws, empty, scripts, legacy, hidden] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     fn req(name: &str, spec: &str) -> Requirement {
