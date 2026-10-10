@@ -74,6 +74,7 @@ pub async fn solve_framework(
         Accelerator::Nvidia {
             name,
             driver_version,
+            ..
         } => {
             let nvidia_json = refresh::read(
                 "nvidia.json",

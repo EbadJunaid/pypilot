@@ -58,6 +58,8 @@ pub const CUDA_EXTENSIONS_JSON: &str = include_str!("../../data/cuda_extensions.
 pub struct GpuInfo {
     pub name: Option<String>,
     pub driver_version: Option<String>,
+    /// e.g. "12.0"; `None` when the driver is too old to report it.
+    pub compute_cap: Option<String>,
     pub apple_silicon: bool,
 }
 
@@ -129,9 +131,11 @@ pub async fn check(
         Accelerator::Nvidia {
             name,
             driver_version,
+            compute_cap,
         } => GpuInfo {
             name: Some(name.clone()),
             driver_version: Some(driver_version.clone()),
+            compute_cap: compute_cap.clone(),
             apple_silicon: false,
         },
         Accelerator::AppleSilicon => GpuInfo {
