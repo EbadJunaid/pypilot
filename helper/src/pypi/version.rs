@@ -148,6 +148,15 @@ impl VersionSpec {
         self.clauses.iter().all(|c| c.matches(&version.release))
     }
 
+    /// Does a version that is already installed satisfy this specifier?
+    ///
+    /// Unlike [`VersionSpec::matches`], pre-releases are not filtered out: that
+    /// rule is about what an installer would *pick*, and once a release is on
+    /// disk only the comparisons matter.
+    pub fn admits(&self, version: &PackageVersion) -> bool {
+        self.clauses.iter().all(|c| c.matches(&version.release))
+    }
+
     /// The newest release satisfying this specifier, which is what an installer
     /// would pick.
     pub fn select_newest<'a, I>(&self, versions: I) -> Option<PackageVersion>
@@ -262,6 +271,16 @@ mod tests {
         let explicit = VersionSpec::parse("==1.1.0rc1");
         let picked = explicit.select_newest(["1.0.0", "1.1.0rc1"]).unwrap();
         assert_eq!(picked.raw, "1.1.0rc1");
+    }
+
+    #[test]
+    fn admits_checks_an_installed_version_including_prereleases() {
+        let below_two = VersionSpec::parse("<2,>=1.21");
+        assert!(below_two.admits(&v("1.26.4")));
+        assert!(!below_two.admits(&v("2.1.0")));
+        assert!(!below_two.admits(&v("2.0.0rc1")));
+        // `matches` would refuse the rc as a pick; `admits` judges it on its release.
+        assert!(VersionSpec::parse(">=1.0").admits(&v("1.1.0rc1")));
     }
 
     #[test]
