@@ -33,7 +33,7 @@ pub struct CudaVersion {
 }
 
 impl CudaVersion {
-    fn parse(s: &str) -> Option<CudaVersion> {
+    pub fn parse(s: &str) -> Option<CudaVersion> {
         let (major, minor) = s.split_once('.')?;
         Some(CudaVersion {
             major: major.parse().ok()?,
@@ -111,6 +111,22 @@ impl DriverTable {
                 _ => row.min_driver_linux.clone(),
             },
             exceeds_known_table: cmp_dotted(&driver, &newest_min_parsed) != Ordering::Less,
+        })
+    }
+}
+
+impl DriverTable {
+    /// The oldest driver that supports CUDA `cuda` on `os`, for messages that
+    /// must say exactly what to update to. Uses the first row at or above
+    /// `cuda`, since the table only records GA releases.
+    pub fn min_driver_for(&self, cuda: CudaVersion, os: Os) -> Option<String> {
+        let row = self
+            .rows
+            .iter()
+            .find(|r| CudaVersion::parse(&r.cuda).is_some_and(|c| c >= cuda))?;
+        Some(match os {
+            Os::Windows => row.min_driver_windows.clone(),
+            _ => row.min_driver_linux.clone(),
         })
     }
 }
@@ -198,6 +214,23 @@ mod tests {
                 major: 12,
                 minor: 2
             }
+        );
+    }
+
+    #[test]
+    fn min_driver_for_cuda_12_8_differs_per_os() {
+        let t = table();
+        let cu128 = CudaVersion {
+            major: 12,
+            minor: 8,
+        };
+        assert_eq!(
+            t.min_driver_for(cu128, Os::Linux).as_deref(),
+            Some("570.26")
+        );
+        assert_eq!(
+            t.min_driver_for(cu128, Os::Windows).as_deref(),
+            Some("570.65")
         );
     }
 

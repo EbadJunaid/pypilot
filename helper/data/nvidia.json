@@ -1,6 +1,6 @@
 {
   "_comment": "NVIDIA driver -> max supported CUDA runtime, GA rows from NVIDIA's official CUDA Toolkit release notes (docs.nvidia.com/cuda/cuda-toolkit-release-notes). Linux and Windows minimum driver versions differ for the same CUDA release, so both are recorded. Rule: wheels bundle their own CUDA runtime, so only the DRIVER floor matters (drivers are backwards compatible) -- system CUDA toolkit version is irrelevant to pip-installed frameworks.",
-  "schema_version": 2,
+  "schema_version": 3,
   "source": "https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html",
   "drivers": [
     { "cuda": "11.0", "min_driver_linux": "450.36.06", "min_driver_windows": "451.22" },
@@ -21,5 +21,18 @@
     { "cuda": "12.6", "min_driver_linux": "560.28.03", "min_driver_windows": "560.76" },
     { "cuda": "12.8", "min_driver_linux": "570.26", "min_driver_windows": "570.65" },
     { "cuda": "12.9", "min_driver_linux": "575.51.03", "min_driver_windows": "576.02" }
+  ],
+  "_architectures_comment": "GPU architecture -> CUDA runtime range a torch build must target to carry kernels for it. A driver new enough for a CUDA release is not sufficient: wheels only contain SASS/PTX for the architectures they were compiled for, so e.g. an RTX 50-series (sm_120) on a cu121 build fails with 'no kernel image is available for execution on the device'. Lookup uses NVIDIA's binary-compatibility rule (a cubin runs on the same major and any higher minor compute capability, docs.nvidia.com/cuda/blackwell-compatibility-guide), so 12.1 (GB10) resolves to the 12.0 row and 10.3 (B300) to the 10.0 row. Sources: CUDA 12.8 release notes (first toolkit with sm_100/sm_120); PyTorch 2.7 release blog (pytorch.org/blog/pytorch-2-7: Blackwell support, first cu128 wheels); CUDA 11.8 release notes (first with sm_89/sm_90); PyTorch 2.8 release notes and dev-discuss.pytorch.org/t/3128 + /t/3290 (sm_50-sm_60 dropped from cu128/cu129 builds, Volta dropped from cu128 in 2.11, none of them in CUDA 13 builds) -- max_cuda 12.6 is therefore the newest build that reliably still carries those kernels.",
+  "architectures": [
+    { "compute_cap": "5.0", "family": "Maxwell", "min_cuda": "11.0", "max_cuda": "12.6" },
+    { "compute_cap": "6.0", "family": "Pascal", "min_cuda": "11.0", "max_cuda": "12.6" },
+    { "compute_cap": "7.0", "family": "Volta", "min_cuda": "11.0", "max_cuda": "12.6" },
+    { "compute_cap": "7.5", "family": "Turing", "min_cuda": "11.0" },
+    { "compute_cap": "8.0", "family": "Ampere", "min_cuda": "11.0" },
+    { "compute_cap": "8.6", "family": "Ampere", "min_cuda": "11.1" },
+    { "compute_cap": "8.9", "family": "Ada Lovelace", "min_cuda": "11.8" },
+    { "compute_cap": "9.0", "family": "Hopper", "min_cuda": "11.8" },
+    { "compute_cap": "10.0", "family": "Blackwell (data center)", "min_cuda": "12.8", "min_torch": "2.7.0" },
+    { "compute_cap": "12.0", "family": "Blackwell (RTX 50-series / RTX PRO)", "min_cuda": "12.8", "min_torch": "2.7.0" }
   ]
 }

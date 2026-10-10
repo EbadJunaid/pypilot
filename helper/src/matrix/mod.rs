@@ -23,6 +23,7 @@
 //! from the project repo, TTL-gated by F7's `data_refresh_days`, and falls
 //! back to the bundled snapshot silently on any failure.
 
+pub mod arch;
 pub mod cuda_ext;
 pub mod frameworks;
 pub mod nvidia;
