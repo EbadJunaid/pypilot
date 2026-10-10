@@ -45,7 +45,9 @@ pub struct CompatReport {
     pub intersection: PyVersionSet,
     /// Populated only when `intersection` is empty.
     pub conflicts: Vec<ConflictPair>,
-    /// Packages that will compile from source (sdist-only) on this platform.
+    /// One-line, OS-neutral summaries of packages that will build from source
+    /// (sdist-only) on this platform. The solver turns `per_package` into the
+    /// full, OS-specific findings.
     pub sdist_warnings: Vec<String>,
 }
 
@@ -133,11 +135,16 @@ pub async fn analyze<S: MetadataSource>(
         match res {
             Ok(meta) => {
                 let analysis = meta.analyze(&platform);
-                if analysis.sdist_only {
-                    sdist_warnings.push(format!(
-                        "{} {} has no prebuilt wheel for your platform — it will compile from source (you may need build tools).",
+                match analysis.sdist_kind() {
+                    Some(metadata::SdistKind::Native) => sdist_warnings.push(format!(
+                        "{} {} publishes wheels for other platforms but not yours — it will compile native code from source and needs a compiler toolchain.",
                         analysis.name, analysis.version
-                    ));
+                    )),
+                    Some(metadata::SdistKind::Unknown) => sdist_warnings.push(format!(
+                        "{} {} publishes only a source distribution — it will build from source and may need a compiler if it has native extensions.",
+                        analysis.name, analysis.version
+                    )),
+                    None => {}
                 }
                 per_package.push(analysis);
             }

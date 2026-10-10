@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::platform::Platform;
-use crate::pypi::pyversion::{parse_requires_python, PyVersionSet};
+use crate::pypi::pyversion::{parse_requires_python, PyVersion, PyVersionSet};
 use crate::pypi::wheel::WheelTags;
 
 /// The subset of a PyPI package JSON document PyPilot consumes.
@@ -110,6 +110,18 @@ impl DistFile {
     }
 }
 
+/// How a package that falls back to its sdist is likely to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdistKind {
+    /// Only an sdist was ever published. Could be pure Python, could be a C
+    /// extension; PyPI metadata can't tell, so treat it as "may need a
+    /// compiler".
+    Unknown,
+    /// Wheels exist for other platforms but not this one: the package has
+    /// native code and building it here needs a compiler toolchain.
+    Native,
+}
+
 /// Result of analyzing one package's latest release against a platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageAnalysis {
@@ -121,6 +133,11 @@ pub struct PackageAnalysis {
     pub has_platform_wheels: bool,
     /// True if only an sdist is available (would compile from source).
     pub sdist_only: bool,
+    /// True if the release ships wheels, just none that install here. Paired
+    /// with `sdist_only` this is the strong "native extension" signal: the
+    /// authors build binaries for other platforms, so the sdist needs a
+    /// compiler.
+    pub has_foreign_wheels: bool,
     /// The `requires_python` string that was in effect (for messaging).
     pub requires_python: Option<String>,
 }
@@ -177,7 +194,7 @@ impl PackageMetadata {
         // If a package has wheels but none for this platform and no sdist, that's
         // still surfaced via has_platform_wheels=false + empty wheel_union, but we
         // fall back to requires_python so we don't wrongly claim zero support.
-        let _ = has_any_wheel;
+        let has_foreign_wheels = has_any_wheel && !has_platform_wheels;
 
         PackageAnalysis {
             name: self.info.name.clone(),
@@ -185,8 +202,39 @@ impl PackageMetadata {
             supported,
             has_platform_wheels,
             sdist_only,
+            has_foreign_wheels,
             requires_python: self.info.requires_python.clone(),
         }
+    }
+}
+
+impl PackageAnalysis {
+    /// How the sdist fallback builds, or `None` when wheels cover this
+    /// platform (or there is no sdist to fall back to).
+    pub fn sdist_kind(&self) -> Option<SdistKind> {
+        if !self.sdist_only {
+            None
+        } else if self.has_foreign_wheels {
+            Some(SdistKind::Native)
+        } else {
+            Some(SdistKind::Unknown)
+        }
+    }
+
+    /// The Python versions `requires_python` admits, before wheel tags narrow
+    /// it. The universe when the package doesn't declare one.
+    pub fn declared(&self) -> PyVersionSet {
+        self.requires_python
+            .as_deref()
+            .map(parse_requires_python)
+            .unwrap_or_else(PyVersionSet::universe)
+    }
+
+    /// True when `py` is excluded only because no wheel exists for it here:
+    /// `requires_python` allows it and other Pythons do get wheels. Installing
+    /// on `py` would fall back to compiling the sdist.
+    pub fn lacks_wheel_for(&self, py: PyVersion) -> bool {
+        self.has_platform_wheels && !self.supported.contains(py) && self.declared().contains(py)
     }
 }
 
@@ -194,7 +242,6 @@ impl PackageMetadata {
 mod tests {
     use super::*;
     use crate::core::platform::{Arch, Os};
-    use crate::pypi::pyversion::PyVersion;
 
     fn linux() -> Platform {
         Platform {
@@ -254,5 +301,60 @@ mod tests {
         assert!(a.sdist_only);
         assert!(!a.has_platform_wheels);
         assert!(a.supported.contains(PyVersion::py3(13)));
+        assert_eq!(a.sdist_kind(), Some(SdistKind::Unknown));
+    }
+
+    fn sdist(name: &str) -> DistFile {
+        DistFile {
+            filename: name.to_string(),
+            packagetype: "sdist".into(),
+            requires_python: None,
+            yanked: false,
+        }
+    }
+
+    #[test]
+    fn wheels_for_other_platforms_mean_native_build() {
+        // Windows-only wheels; on Linux the sdist needs a compiler.
+        let meta = PackageMetadata {
+            info: Info {
+                name: "nativelib".into(),
+                version: "2.0".into(),
+                requires_python: Some(">=3.9".into()),
+            },
+            urls: vec![
+                wheel("nativelib-2.0-cp312-cp312-win_amd64.whl"),
+                sdist("nativelib-2.0.tar.gz"),
+            ],
+            versions: vec!["2.0".into()],
+        };
+        let a = meta.analyze(&linux());
+        assert!(a.sdist_only);
+        assert!(a.has_foreign_wheels);
+        assert_eq!(a.sdist_kind(), Some(SdistKind::Native));
+    }
+
+    #[test]
+    fn platform_wheels_mean_no_sdist_kind() {
+        let meta = PackageMetadata {
+            info: Info {
+                name: "mediapipe".into(),
+                version: "0.10.9".into(),
+                requires_python: Some(">=3.8".into()),
+            },
+            urls: vec![
+                wheel("mediapipe-0.10.9-cp312-cp312-manylinux_2_17_x86_64.whl"),
+                sdist("mediapipe-0.10.9.tar.gz"),
+            ],
+            versions: vec!["0.10.9".into()],
+        };
+        let a = meta.analyze(&linux());
+        assert_eq!(a.sdist_kind(), None);
+        assert!(!a.has_foreign_wheels);
+        // 3.13 is allowed by requires_python but has no wheel: a source build.
+        assert!(a.lacks_wheel_for(PyVersion::py3(13)));
+        // 3.7 is excluded by requires_python itself, not by a missing wheel.
+        assert!(!a.lacks_wheel_for(PyVersion::py3(7)));
+        assert!(!a.lacks_wheel_for(PyVersion::py3(12)));
     }
 }

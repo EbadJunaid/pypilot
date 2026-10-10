@@ -324,6 +324,7 @@ mod tests {
             supported: PyVersionSet::from_versions(minors.iter().map(|&m| PyVersion::py3(m))),
             has_platform_wheels: true,
             sdist_only: false,
+            has_foreign_wheels: false,
             requires_python: None,
         }
     }
