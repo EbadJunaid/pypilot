@@ -7,13 +7,13 @@
 //! index happens to hand back.
 
 use crate::core::gpu::{self, Accelerator};
-use crate::core::platform::Platform;
+use crate::core::platform::{Os, Platform};
 use crate::core::project::Requirement;
 use crate::core::{Finding, FixKind, Severity};
 use crate::matrix::frameworks::{CudaBuild, Framework, FrameworkTable, ReleaseInfo};
 use crate::matrix::nvidia::{CudaVersion, DriverSupport, DriverTable};
 use crate::matrix::refresh;
-use crate::pypi::version::VersionSpec;
+use crate::pypi::version::{PackageVersion, VersionSpec};
 use crate::settings::Settings;
 
 /// What solving one framework dependency produced.
@@ -52,6 +52,18 @@ pub async fn solve_framework(
     let accelerator = gpu::detect().await;
 
     let version = resolve_version(&table, framework, requirement)?;
+
+    // Checked before the release lookup: native Windows is CPU-only for every
+    // tensorflow past 2.10 no matter what the driver supports, and 2.10 itself
+    // predates the bundled table, so neither branch below would say so.
+    if let Some(gpu_name) =
+        native_windows_tensorflow_gpu(framework, Platform::current().os, &accelerator)
+    {
+        let mut solved = tensorflow_native_windows(&table, requirement, &version, gpu_name);
+        solved.resolved_version = Some(version);
+        return Some(solved);
+    }
+
     let Some(release) = table.release(framework, &version) else {
         return Some(unknown_release(framework, &version));
     };
@@ -284,6 +296,93 @@ fn solve_tensorflow(
     }
 }
 
+/// The first tensorflow release without GPU support on native Windows. 2.10
+/// was the last with it; from 2.11 on, tensorflow.org/install/pip sends
+/// Windows GPU users to WSL2, and a native install silently runs on the CPU.
+const TF_FIRST_CPU_ONLY_ON_WINDOWS: &str = "2.11";
+
+/// The NVIDIA GPU's name when this is tensorflow on native Windows with an
+/// NVIDIA GPU present: the one combination where tensorflow's GPU story
+/// depends on the version rather than the driver. Linux, WSL2 (which reports
+/// itself as Linux) and GPU-less machines go through the usual solve.
+fn native_windows_tensorflow_gpu(
+    framework: Framework,
+    os: Os,
+    accelerator: &Accelerator,
+) -> Option<&str> {
+    match accelerator {
+        Accelerator::Nvidia { name, .. }
+            if framework == Framework::TensorFlow && os == Os::Windows =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// Can this requirement install a tensorflow newer than 2.10? Unpinned always
+/// can. A pin is tested against the curated releases, the first CPU-only one,
+/// and whatever [`resolve_version`] made of it, so a pin newer than the bundled
+/// table still counts while a cap like `<2.11` does not.
+fn tensorflow_past_native_windows_gpu(
+    table: &FrameworkTable,
+    requirement: Option<&Requirement>,
+    resolved: &str,
+) -> bool {
+    let Some(req) = requirement.filter(|r| r.is_pinned()) else {
+        return true;
+    };
+    let spec = VersionSpec::parse(&req.spec);
+    let Some(first) = PackageVersion::parse(TF_FIRST_CPU_ONLY_ON_WINDOWS) else {
+        return true;
+    };
+    let mut candidates = table.all_versions(Framework::TensorFlow);
+    candidates.push(TF_FIRST_CPU_ONLY_ON_WINDOWS.to_string());
+    candidates.push(resolved.to_string());
+    candidates
+        .iter()
+        .filter_map(|v| PackageVersion::parse(v))
+        .any(|v| v >= first && spec.matches(&v))
+}
+
+/// tensorflow with an NVIDIA GPU on native Windows. Past 2.10 there is no GPU
+/// build to match the driver to, so the driver checks would only mislead; the
+/// useful answer is that the GPU will sit idle and what to do about it.
+fn tensorflow_native_windows(
+    table: &FrameworkTable,
+    requirement: Option<&Requirement>,
+    version: &str,
+    gpu_name: &str,
+) -> FrameworkSolve {
+    let finding = if tensorflow_past_native_windows_gpu(table, requirement, version) {
+        Finding {
+            severity: Severity::Warning,
+            title: "tensorflow will run on the CPU on native Windows".to_string(),
+            detail: format!(
+                "{gpu_name} detected, but tensorflow 2.10 was the last release with GPU support on native Windows; tensorflow {version} installs and runs CPU-only here. To use the GPU: run the project in WSL2 and install tensorflow[and-cuda]; or pin tensorflow<2.11 on Python 3.10 or older with CUDA 11.2 and cuDNN 8.1 (conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0); or use PyTorch, which ships CUDA builds for Windows. See tensorflow.org/install/pip."
+            ),
+            fix: FixKind::Manual,
+        }
+    } else {
+        // Only reachable with a pin, and the pin text is what the user wrote:
+        // for a cap like `<2.11` the resolved version would read as 2.11.
+        let pinned = requirement.map(|r| r.spec.as_str()).unwrap_or_default();
+        Finding {
+            severity: Severity::Info,
+            title: "tensorflow GPU on native Windows needs CUDA 11.2".to_string(),
+            detail: format!(
+                "tensorflow{pinned} predates the end of native-Windows GPU support, so it can use {gpu_name}, but its wheel does not bundle CUDA: it needs Python 3.10 or older plus CUDA 11.2 and cuDNN 8.1 (conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0). See tensorflow.org/install/pip."
+            ),
+            fix: FixKind::Manual,
+        }
+    };
+    FrameworkSolve {
+        finding: Some(finding),
+        index_url: None,
+        ..Default::default()
+    }
+}
+
 fn unknown_release(framework: Framework, version: &str) -> FrameworkSolve {
     let name = framework_display_name(framework);
     FrameworkSolve {
@@ -468,6 +567,110 @@ mod tests {
             .unwrap()
             .detail
             .contains("conservative floor"));
+    }
+
+    fn nvidia() -> Accelerator {
+        Accelerator::Nvidia {
+            name: "RTX 4070".into(),
+            driver_version: "560.94".into(),
+        }
+    }
+
+    fn pinned(spec: &str) -> Requirement {
+        Requirement {
+            name: "tensorflow".into(),
+            spec: spec.into(),
+        }
+    }
+
+    #[test]
+    fn native_windows_tensorflow_needs_windows_nvidia_and_tensorflow() {
+        let gpu = nvidia();
+        assert_eq!(
+            native_windows_tensorflow_gpu(Framework::TensorFlow, Os::Windows, &gpu),
+            Some("RTX 4070")
+        );
+        // Linux covers WSL2, where tensorflow[and-cuda] does use the GPU.
+        assert!(native_windows_tensorflow_gpu(Framework::TensorFlow, Os::Linux, &gpu).is_none());
+        assert!(native_windows_tensorflow_gpu(Framework::Torch, Os::Windows, &gpu).is_none());
+        assert!(native_windows_tensorflow_gpu(
+            Framework::TensorFlow,
+            Os::Windows,
+            &Accelerator::None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn tensorflow_versions_past_2_10_are_cpu_only_on_windows() {
+        let t = table();
+        let past = |req: Option<&Requirement>, resolved: &str| {
+            tensorflow_past_native_windows_gpu(&t, req, resolved)
+        };
+        let latest = t.latest(Framework::TensorFlow).unwrap().to_string();
+
+        assert!(past(None, &latest), "unpinned installs the newest release");
+        assert!(past(Some(&pinned("==2.16.1")), "2.16.1"));
+        assert!(past(Some(&pinned(">=2.10")), &latest));
+        assert!(past(Some(&pinned("~=2.10")), &latest));
+        assert!(past(Some(&pinned("==2.11.0")), "2.11.0"));
+        // Newer than the bundled table still counts.
+        assert!(past(Some(&pinned("==2.99.0")), "2.99.0"));
+
+        assert!(!past(Some(&pinned("<2.11")), "2.11"));
+        assert!(!past(Some(&pinned("==2.10.1")), "2.10.1"));
+        assert!(!past(Some(&pinned("~=2.10.0")), "2.10.0"));
+        assert!(!past(Some(&pinned(">=2.9,<=2.10.1")), "2.10.1"));
+    }
+
+    #[test]
+    fn modern_tensorflow_on_native_windows_warns_with_the_ways_out() {
+        let solved = tensorflow_native_windows(&table(), None, "2.21.0", "RTX 4070");
+        assert!(solved.index_url.is_none(), "no GPU build to point at");
+        let f = solved.finding.unwrap();
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.title.contains("CPU"));
+        assert!(f.detail.contains("RTX 4070"));
+        assert!(f.detail.contains("WSL2"));
+        assert!(f.detail.contains("tensorflow[and-cuda]"));
+        assert!(f.detail.contains("tensorflow<2.11"));
+        assert!(f.detail.contains("PyTorch"));
+        assert!(
+            !f.detail.contains("Update the driver"),
+            "the driver is not what keeps tensorflow off the GPU here"
+        );
+    }
+
+    #[test]
+    fn legacy_tensorflow_on_native_windows_names_its_cuda_needs() {
+        let req = pinned("<2.11");
+        let solved = tensorflow_native_windows(&table(), Some(&req), "2.11", "RTX 4070");
+        assert!(solved.index_url.is_none());
+        let f = solved.finding.unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.detail.contains("tensorflow<2.11"));
+        assert!(f.detail.contains("CUDA 11.2"));
+        assert!(f.detail.contains("cuDNN 8.1"));
+        assert!(f.detail.contains("Python 3.10"));
+    }
+
+    #[tokio::test]
+    async fn tensorflow_solve_never_claims_a_gpu_build_on_native_windows() {
+        // Whatever the machine has: on Windows with an NVIDIA GPU the finding
+        // must be the CPU-only warning, and tensorflow never gets an index.
+        let solved = solve_framework("tensorflow", None, &Settings::default())
+            .await
+            .unwrap();
+        assert!(solved.index_url.is_none());
+        let windows_nvidia = native_windows_tensorflow_gpu(
+            Framework::TensorFlow,
+            Platform::current().os,
+            &gpu::detect().await,
+        )
+        .is_some();
+        if windows_nvidia {
+            assert_eq!(solved.finding.unwrap().severity, Severity::Warning);
+        }
     }
 
     #[tokio::test]
