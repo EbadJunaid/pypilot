@@ -1,0 +1,86 @@
+{
+  "_comment": "CUDA extension packages that commonly fail to install, and why. `releases` rows apply from their version up to the next row; a pin that matches a row exactly uses that row. `platforms` lists where PyPI has a binary wheel (os-arch); anywhere else pip compiles the sdist. `torch` is the requirement that release's wheels declare on torch (its compiled kernels are tied to that torch ABI). Wheel and torch data verified against https://pypi.org/pypi/<package>/json and https://pypi.org/pypi/xformers/<version>/json (requires_dist). flash-attn, mamba-ssm and causal-conv1d publish only sdists whose setup.py imports torch, which fails under build isolation (https://discuss.huggingface.co/t/170972, https://github.com/Dao-AILab/flash-attention#installation-and-features). bitsandbytes shipped Linux-only binaries inside `any` wheels before 0.43.0, added win_amd64 in 0.43.0, linux aarch64 in 0.46.0, macOS arm64 in 0.49.0 and win_arm64 in 0.50.0.",
+  "schema_version": 1,
+  "packages": [
+    {
+      "name": "flash-attn",
+      "requires_cuda": true,
+      "build_needs_torch": true,
+      "build_note": "On Linux its setup.py first tries to download a prebuilt wheel from the flash-attention GitHub releases for the exact torch, CUDA and Python in use, and compiles only when none matches.",
+      "alternative": "PyTorch's built-in scaled_dot_product_attention covers most uses: in transformers pass attn_implementation=\"sdpa\". On Windows, WSL2 gets the Linux prebuilt wheels.",
+      "releases": [
+        { "version": "0", "platforms": [] }
+      ]
+    },
+    {
+      "name": "mamba-ssm",
+      "requires_cuda": true,
+      "build_needs_torch": true,
+      "build_note": "On Linux its setup.py first tries to download a prebuilt wheel from the mamba GitHub releases for the exact torch, CUDA and Python in use, and compiles only when none matches.",
+      "alternative": "transformers' Mamba models fall back to a slower pure-PyTorch path when mamba-ssm is absent. On Windows, use WSL2.",
+      "releases": [
+        { "version": "0", "platforms": [] }
+      ]
+    },
+    {
+      "name": "causal-conv1d",
+      "requires_cuda": true,
+      "build_needs_torch": true,
+      "build_note": "On Linux its setup.py first tries to download a prebuilt wheel from the causal-conv1d GitHub releases for the exact torch, CUDA and Python in use, and compiles only when none matches.",
+      "alternative": "It is optional for mamba-ssm and transformers' Mamba models, which fall back to a PyTorch implementation without it. On Windows, use WSL2.",
+      "releases": [
+        { "version": "0", "platforms": [] }
+      ]
+    },
+    {
+      "name": "xformers",
+      "requires_cuda": true,
+      "build_needs_torch": true,
+      "alternative": "PyTorch 2's built-in scaled_dot_product_attention replaces most xformers memory-efficient attention (diffusers and transformers use it by default).",
+      "releases": [
+        { "version": "0.0.22", "torch": "==2.0.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.22.post7", "torch": "==2.1.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.23", "torch": "==2.1.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.23.post1", "torch": "==2.1.2", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.24", "torch": "==2.2.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.25", "torch": "==2.2.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.25.post1", "torch": "==2.2.2", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.26.post1", "torch": "==2.3.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.27", "torch": "==2.3.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.27.post1", "torch": "==2.4.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.27.post2", "torch": "==2.4.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.28", "torch": "==2.4.1", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.28.post1", "torch": "==2.4.1", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.28.post2", "torch": "==2.5.0", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.28.post3", "torch": "==2.5.1", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.29", "torch": "==2.5.1", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.29.post1", "torch": "==2.5.1", "platforms": ["linux-x86_64"] },
+        { "version": "0.0.29.post2", "torch": "==2.6.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.29.post3", "torch": "==2.6.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.30", "torch": "==2.7.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.31", "torch": "==2.7.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.31.post1", "torch": "==2.7.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.32.post1", "torch": "==2.8.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.32.post2", "torch": "==2.8.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.33", "torch": "==2.9.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.33.post1", "torch": "==2.9.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.33.post2", "torch": "==2.9.1", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.34", "torch": "==2.10.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.0.35", "torch": ">=2.10", "platforms": ["linux-x86_64", "windows-x86_64"] }
+      ]
+    },
+    {
+      "name": "bitsandbytes",
+      "requires_cuda": false,
+      "build_needs_torch": false,
+      "alternative": "Upgrade to bitsandbytes 0.43.0+ for native Windows wheels, or 0.49.0+ for Apple Silicon (macOS 14+). Intel Macs have no build; skip 8-bit/4-bit quantization there.",
+      "releases": [
+        { "version": "0", "platforms": ["linux-x86_64"] },
+        { "version": "0.43.0", "platforms": ["linux-x86_64", "windows-x86_64"] },
+        { "version": "0.46.0", "platforms": ["linux-x86_64", "linux-aarch64", "windows-x86_64"] },
+        { "version": "0.49.0", "platforms": ["linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-aarch64"] },
+        { "version": "0.50.0", "platforms": ["linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-aarch64", "macos-aarch64"] }
+      ]
+    }
+  ]
+}
