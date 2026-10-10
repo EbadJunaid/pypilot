@@ -7,14 +7,16 @@
 
 use std::path::Path;
 
-use crate::core::platform::Platform;
+use crate::core::platform::{Os, Platform};
 use crate::core::probe::Probes;
 use crate::core::project::ProjectDeps;
 #[cfg(test)]
 use crate::core::project::Requirement;
+use crate::core::toolchain::{self, Toolchain};
 use crate::core::uv;
 use crate::core::{Assessment, Finding, FixKind, Severity};
 use crate::matrix;
+use crate::pypi::metadata::{PackageAnalysis, SdistKind};
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{self, CompatReport, MetadataSource};
 use crate::settings::{PackageManager, Settings};
@@ -31,6 +33,9 @@ pub struct EnvSummary {
     /// The venv has an `ipykernel` that works on its Python, so Jupyter and
     /// VS Code can use it as a kernel.
     pub venv_has_ipykernel: bool,
+    /// Build tools on this machine, probed only when some dependency would
+    /// compile from source. `None` means not probed: advise everything.
+    pub toolchain: Option<Toolchain>,
 }
 
 impl EnvSummary {
@@ -47,6 +52,7 @@ impl EnvSummary {
                     v.python,
                 )
             }),
+            toolchain: None,
         }
     }
 }
@@ -69,7 +75,15 @@ pub async fn assess<S: MetadataSource>(
     // F2 seam (empty in Phase 1).
     let hardware = matrix::check(workspace, settings, &project.packages).await;
 
-    let env = EnvSummary::from_probes(&probes, workspace);
+    let mut env = EnvSummary::from_probes(&probes, workspace);
+    // Probing compilers spawns processes, so only do it when a dependency
+    // would actually build from source.
+    if compat
+        .as_ref()
+        .is_some_and(|c| needs_source_build(c, env.venv_python))
+    {
+        env.toolchain = Some(toolchain::detect(Platform::current().os).await);
+    }
     let (target_python, mut findings) = synthesize(&env, &project, compat.as_ref());
     findings.extend(hardware.findings);
 
@@ -211,14 +225,11 @@ pub fn synthesize(
         });
     }
 
-    // sdist-only compile warnings.
-    for w in &compat.sdist_warnings {
-        findings.push(Finding {
-            severity: Severity::Warning,
-            title: "Will compile from source".to_string(),
-            detail: w.clone(),
-            fix: FixKind::Manual,
-        });
+    // sdist-only compile warnings, with the toolchain advice for this OS.
+    for p in &compat.per_package {
+        if let Some(kind) = p.sdist_kind() {
+            findings.push(sdist_finding(p, kind, compat, env.toolchain));
+        }
     }
 
     // Empty intersection → hard conflict; can't be auto-fixed by choosing a version.
@@ -248,7 +259,8 @@ pub fn synthesize(
 
         // Venv exists but its Python is unsupported → recreate on the right version.
         Some(current) => {
-            let why = incompat_reason(compat, current, target);
+            let mut why = incompat_reason(compat, current, target);
+            why.push_str(&wheel_gap_note(compat, current, target, env.toolchain));
             findings.push(Finding {
                 severity: Severity::Error,
                 title: format!("Python {current} is not supported by this project"),
@@ -279,6 +291,105 @@ pub fn synthesize(
     }
 
     (target, findings)
+}
+
+/// Would installing the project compile anything from source? True for any
+/// sdist-only dependency, and for one whose wheels skip the venv's Python.
+fn needs_source_build(compat: &CompatReport, venv_python: Option<PyVersion>) -> bool {
+    compat
+        .per_package
+        .iter()
+        .any(|p| p.sdist_only || venv_python.is_some_and(|py| p.lacks_wheel_for(py)))
+}
+
+fn os_name(os: Os) -> &'static str {
+    match os {
+        Os::Windows => "Windows",
+        Os::Macos => "macOS",
+        Os::Linux => "Linux",
+    }
+}
+
+/// The "Will compile from source" finding for one sdist-only dependency.
+///
+/// No other Python helps here (no wheel exists for this platform at all), so
+/// the fix is the toolchain. When the needed tools are already installed the
+/// finding drops to Info: the build should just work.
+fn sdist_finding(
+    p: &PackageAnalysis,
+    kind: SdistKind,
+    compat: &CompatReport,
+    toolchain: Option<Toolchain>,
+) -> Finding {
+    let os = compat.platform.os;
+    let advice = toolchain::build_advice(&p.name, os, toolchain);
+    let what = match kind {
+        SdistKind::Native => format!(
+            "{} {} ships prebuilt wheels for other platforms but none for {}, so installing it compiles native code from source.",
+            p.name,
+            p.version,
+            os_name(os)
+        ),
+        SdistKind::Unknown => format!(
+            "{} {} publishes only a source distribution, so it builds from source; if it has C/C++/Rust extensions that needs a compiler.",
+            p.name, p.version
+        ),
+    };
+    let (severity, detail) = match advice {
+        Some(a) => (
+            Severity::Warning,
+            format!("{what} If the build fails (\"Failed building wheel\", \"Microsoft Visual C++ 14.0 or greater is required\"): {a}."),
+        ),
+        None => (
+            Severity::Info,
+            format!("{what} The build tools it needs are installed."),
+        ),
+    };
+    Finding {
+        severity,
+        title: "Will compile from source".to_string(),
+        detail,
+        fix: FixKind::Manual,
+    }
+}
+
+/// Extra explanation when the venv's Python is excluded only because some
+/// dependency has no wheel for it: pip would fall back to a source build that
+/// needs a compiler, and switching to `target` (which has wheels) avoids it.
+fn wheel_gap_note(
+    compat: &CompatReport,
+    current: PyVersion,
+    target: Option<PyVersion>,
+    toolchain: Option<Toolchain>,
+) -> String {
+    let gaps: Vec<&PackageAnalysis> = compat
+        .per_package
+        .iter()
+        .filter(|p| p.lacks_wheel_for(current))
+        .collect();
+    if gaps.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = gaps.iter().map(|p| p.name.as_str()).collect();
+    let mut note = format!(
+        " {} {} no prebuilt wheel for Python {current} on {}, so installing on it means compiling from source",
+        names.join(", "),
+        if gaps.len() == 1 { "has" } else { "have" },
+        os_name(compat.platform.os)
+    );
+    if let Some(t) = target {
+        note.push_str(&format!("; Python {t} has wheels and needs no compiler"));
+    }
+    note.push('.');
+    // Advice for staying on this Python anyway.
+    let advice: Vec<String> = gaps
+        .iter()
+        .filter_map(|p| toolchain::build_advice(&p.name, compat.platform.os, toolchain))
+        .collect();
+    if let Some(a) = advice.iter().max_by_key(|a| a.len()) {
+        note.push_str(&format!(" To keep Python {current}: {a}."));
+    }
+    note
 }
 
 /// Explain why the current interpreter is unsupported, naming the blockers.
@@ -325,7 +436,6 @@ fn capping_clause(compat: &CompatReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pypi::metadata::PackageAnalysis;
     use crate::pypi::pyversion::PyVersionSet;
 
     fn analysis(name: &str, minors: &[u8]) -> PackageAnalysis {
@@ -450,6 +560,128 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.title == "No environment set up yet"));
+    }
+
+    fn report_on(os: Os, pkgs: Vec<PackageAnalysis>) -> CompatReport {
+        CompatReport {
+            platform: Platform {
+                os,
+                arch: crate::core::platform::Arch::X86_64,
+            },
+            ..report(pkgs)
+        }
+    }
+
+    fn sdist_pkg(name: &str, foreign_wheels: bool) -> PackageAnalysis {
+        PackageAnalysis {
+            has_platform_wheels: false,
+            sdist_only: true,
+            has_foreign_wheels: foreign_wheels,
+            ..analysis(name, &[9, 10, 11, 12, 13])
+        }
+    }
+
+    fn compat_venv(py: u8) -> EnvSummary {
+        EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(py)),
+            uv_present: true,
+            interpreters: vec![PyVersion::py3(py)],
+            ..Default::default()
+        }
+    }
+
+    fn sdist_findings(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.title == "Will compile from source")
+            .collect()
+    }
+
+    #[test]
+    fn native_sdist_on_windows_names_build_tools() {
+        let compat = report_on(Os::Windows, vec![sdist_pkg("nativelib", true)]);
+        let (_t, findings) = synthesize(&compat_venv(12), &python_project(), Some(&compat));
+        let f = sdist_findings(&findings)[0];
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f
+            .detail
+            .contains("wheels for other platforms but none for Windows"));
+        assert!(f.detail.contains("Microsoft C++ Build Tools"));
+        assert!(f.detail.contains("Desktop development with C++"));
+        assert_eq!(f.fix, FixKind::Manual);
+    }
+
+    #[test]
+    fn unknown_sdist_hedges_and_uses_os_advice() {
+        let compat = report_on(Os::Macos, vec![sdist_pkg("oldlib", false)]);
+        let (_t, findings) = synthesize(&compat_venv(12), &python_project(), Some(&compat));
+        let f = sdist_findings(&findings)[0];
+        assert!(f.detail.contains("only a source distribution"));
+        assert!(f.detail.contains("xcode-select --install"));
+
+        let compat = report_on(Os::Linux, vec![sdist_pkg("tokenizers", true)]);
+        let (_t, findings) = synthesize(&compat_venv(12), &python_project(), Some(&compat));
+        let f = sdist_findings(&findings)[0];
+        assert!(f.detail.contains("build-essential"));
+        assert!(f.detail.contains("rustup"));
+    }
+
+    #[test]
+    fn installed_toolchain_downgrades_sdist_finding() {
+        let compat = report_on(Os::Windows, vec![sdist_pkg("nativelib", true)]);
+        let env = EnvSummary {
+            toolchain: Some(Toolchain {
+                c_compiler: true,
+                rust: false,
+            }),
+            ..compat_venv(12)
+        };
+        let (_t, findings) = synthesize(&env, &python_project(), Some(&compat));
+        let f = sdist_findings(&findings)[0];
+        assert_eq!(f.severity, Severity::Info);
+        assert!(!f.detail.contains("Build Tools"));
+        assert!(findings.iter().all(|f| f.severity == Severity::Info));
+    }
+
+    #[test]
+    fn wheel_gap_recommends_python_with_wheels() {
+        // Wheels for 3.9-3.12 only, requires_python allows 3.13: on a 3.13
+        // venv pip would compile it, so recommend 3.12 and explain why.
+        let gap = PackageAnalysis {
+            requires_python: Some(">=3.9".into()),
+            ..analysis("mediapipe", &[9, 10, 11, 12])
+        };
+        let compat = report_on(Os::Windows, vec![gap]);
+        let (target, findings) = synthesize(&compat_venv(13), &python_project(), Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(12)));
+        let f = findings
+            .iter()
+            .find(|f| f.severity == Severity::Error)
+            .unwrap();
+        assert_eq!(f.fix, FixKind::RecreateWithPython(PyVersion::py3(12)));
+        assert!(f
+            .detail
+            .contains("no prebuilt wheel for Python 3.13 on Windows"));
+        assert!(f.detail.contains("Python 3.12 has wheels"));
+        assert!(f.detail.contains("Microsoft C++ Build Tools"));
+        assert!(needs_source_build(&compat, Some(PyVersion::py3(13))));
+        assert!(!needs_source_build(&compat, Some(PyVersion::py3(12))));
+    }
+
+    #[test]
+    fn requires_python_exclusion_is_not_a_wheel_gap() {
+        let capped = PackageAnalysis {
+            requires_python: Some(">=3.9,<3.13".into()),
+            ..analysis("capped", &[9, 10, 11, 12])
+        };
+        let compat = report_on(Os::Linux, vec![capped]);
+        let (_t, findings) = synthesize(&compat_venv(13), &python_project(), Some(&compat));
+        let f = findings
+            .iter()
+            .find(|f| f.severity == Severity::Error)
+            .unwrap();
+        assert!(!f.detail.contains("compiling from source"));
     }
 
     #[test]
