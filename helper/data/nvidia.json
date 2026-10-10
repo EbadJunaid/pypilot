@@ -32,7 +32,7 @@
     { "compute_cap": "8.6", "family": "Ampere", "min_cuda": "11.1" },
     { "compute_cap": "8.9", "family": "Ada Lovelace", "min_cuda": "11.8" },
     { "compute_cap": "9.0", "family": "Hopper", "min_cuda": "11.8" },
-    { "compute_cap": "10.0", "family": "Blackwell (data center)", "min_cuda": "12.8", "min_torch": "2.7.0" },
-    { "compute_cap": "12.0", "family": "Blackwell (RTX 50-series / RTX PRO)", "min_cuda": "12.8", "min_torch": "2.7.0" }
+    { "compute_cap": "10.0", "family": "Blackwell data center", "min_cuda": "12.8", "min_torch": "2.7.0" },
+    { "compute_cap": "12.0", "family": "Blackwell RTX 50-series / RTX PRO", "min_cuda": "12.8", "min_torch": "2.7.0" }
   ]
 }

@@ -89,7 +89,7 @@ impl ArchRequirement {
         PackageVersion::parse(version).map_or(true, |v| v >= min)
     }
 
-    /// "RTX 5090 (Blackwell (RTX 50-series / RTX PRO), sm_120)".
+    /// "RTX 5090 (Blackwell RTX 50-series / RTX PRO, sm_120)".
     pub fn describe(&self, gpu_name: &str) -> String {
         format!("{gpu_name} ({}, {})", self.family, self.cap.sm())
     }
