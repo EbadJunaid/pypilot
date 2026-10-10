@@ -24,6 +24,7 @@ pub mod solver;
 pub mod stdlib;
 pub mod toolchain;
 pub mod torch_gpu;
+pub mod torch_index;
 pub mod uv;
 
 use crate::pypi::{CompatReport, PyVersion};
