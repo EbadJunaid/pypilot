@@ -14,7 +14,7 @@ use zed_extension_api::{self as zed, LanguageServerId, Result};
 
 /// GitHub repo that hosts the helper release assets. Must match the release
 /// workflow in `.github/workflows/release.yml`.
-const HELPER_REPO: &str = "Abdullah-Masood-05/pypilot";
+const HELPER_REPO: &str = "pypilot-dev/pypilot";
 
 /// Oldest helper version this shim trusts when it finds one on `$PATH`. A
 /// helper older than this predates whatever the shim currently assumes about

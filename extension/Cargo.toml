@@ -14,7 +14,7 @@ rust-version = "1.80"
 # is what compiles into the binary they distribute. AGPL is not on that list,
 # which is why the helper and the extension are licensed separately.
 license = "Apache-2.0"
-repository = "https://github.com/Abdullah-Masood-05/pypilot"
+repository = "https://github.com/pypilot-dev/pypilot"
 authors = ["PyPilot contributors"]
 description = "Zed shim for PyPilot. Downloads the helper binary for your platform and registers it as a Python language server."
 

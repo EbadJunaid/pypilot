@@ -50,7 +50,7 @@ NVIDIA_NOTES = "https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.ht
 OLDEST_CUDA_TAG = 118  # Older indexes are frozen; not worth tracking.
 
 OK, STALE, INFO, ERROR = "ok", "stale", "info", "error"
-USER_AGENT = "pypilot-check-data (+https://github.com/Abdullah-Masood-05/pypilot)"
+USER_AGENT = "pypilot-check-data (+https://github.com/pypilot-dev/pypilot)"
 
 
 class NetworkError(Exception):

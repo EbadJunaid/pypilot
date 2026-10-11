@@ -15,8 +15,7 @@ use std::time::SystemTime;
 use crate::core::platform;
 use crate::settings::Settings;
 
-const BASE_URL: &str =
-    "https://raw.githubusercontent.com/Abdullah-Masood-05/pypilot/main/helper/data";
+const BASE_URL: &str = "https://raw.githubusercontent.com/pypilot-dev/pypilot/main/helper/data";
 
 /// The datasets, paired with the bundled fallback and the refresh URL.
 pub const DATASETS: &[(&str, &str)] = &[

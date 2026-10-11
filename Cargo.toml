@@ -17,7 +17,7 @@ edition = "2021"
 rust-version = "1.80"
 # No workspace-wide license: the two crates differ. See LICENSE and the
 # "License" section of README.md.
-repository = "https://github.com/Abdullah-Masood-05/pypilot"
+repository = "https://github.com/pypilot-dev/pypilot"
 authors = ["PyPilot contributors"]
 
 [profile.release]
