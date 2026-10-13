@@ -15,6 +15,7 @@ pub mod installed;
 pub mod interpreter;
 pub mod modules;
 pub mod pip;
+pub mod pixi;
 pub mod platform;
 pub mod probe;
 pub mod project;

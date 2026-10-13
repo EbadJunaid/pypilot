@@ -1,0 +1,15 @@
+[workspace]
+authors = ["Abdullah Masood <Abdullah-Masood-05@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "projA"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.12.*"
+numpy = ">=2.5.4,<3"
+
+[pypi-dependencies]
+requests = ">=2.34.2, <3"

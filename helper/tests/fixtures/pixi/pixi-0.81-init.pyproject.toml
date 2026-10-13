@@ -1,0 +1,22 @@
+[project]
+authors = [{name = "Abdullah Masood", email = "Abdullah-Masood-05@users.noreply.github.com"}]
+dependencies = ["requests>=2.34.2,<3"]
+name = "projB"
+requires-python = ">= 3.11"
+version = "0.1.0"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.pypi-dependencies]
+projb = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+python = "3.12.*"
