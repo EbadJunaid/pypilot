@@ -4,6 +4,7 @@ use std::path::Path;
 
 use colored::Colorize;
 
+use crate::core::project::ProjectDeps;
 use crate::core::solver;
 use crate::core::Severity;
 use crate::pypi::MetadataSource;
@@ -119,14 +120,11 @@ pub async fn run<S: MetadataSource>(
                 rp.to_string().green().bold()
             );
         }
-        let deps = a
-            .project
-            .packages
-            .iter()
-            .map(|r| r.to_string().bold().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {:<16}: {deps}", "dependencies");
+        println!(
+            "  {:<16}: {}",
+            "dependencies",
+            dependency_list(&a.project).bold()
+        );
     }
     println!();
 
@@ -197,4 +195,76 @@ pub async fn run<S: MetadataSource>(
     crate::core::rescan::notify(workspace, crate::core::rescan::Kind::Doctor);
 
     Ok(())
+}
+
+/// The project's dependencies for the report. A pixi project has two kinds,
+/// installed by different solvers, so each list is labelled:
+/// `conda: numpy>=1.26 · pypi: requests>=2.31`.
+fn dependency_list(project: &ProjectDeps) -> String {
+    let pypi = project
+        .packages
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !project.is_pixi() {
+        return pypi;
+    }
+    let conda = project
+        .conda_deps
+        .iter()
+        .map(|d| match d.spec.trim() {
+            "" | "*" => d.name.clone(),
+            spec if spec.starts_with(['<', '>', '=', '!', '~']) => format!("{}{spec}", d.name),
+            spec => format!("{} {spec}", d.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut parts = Vec::new();
+    if !conda.is_empty() {
+        parts.push(format!("conda: {conda}"));
+    }
+    if !pypi.is_empty() {
+        parts.push(format!("pypi: {pypi}"));
+    }
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::pixi::CondaDep;
+    use crate::core::project::Requirement;
+
+    #[test]
+    fn pixi_dependencies_are_labelled_by_source() {
+        let conda = |name: &str, spec: &str| CondaDep {
+            name: name.into(),
+            spec: spec.into(),
+        };
+        let mut project = ProjectDeps {
+            packages: vec![Requirement {
+                name: "requests".into(),
+                spec: ">=2.31".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(dependency_list(&project), "requests>=2.31");
+
+        project.pixi_manifest = Some("pixi.toml".into());
+        project.conda_deps = vec![
+            conda("numpy", ">=1.26"),
+            conda("scipy", "*"),
+            conda("pandas", "2.2.*"),
+        ];
+        assert_eq!(
+            dependency_list(&project),
+            "conda: numpy>=1.26, scipy, pandas 2.2.* · pypi: requests>=2.31"
+        );
+        project.packages.clear();
+        assert_eq!(
+            dependency_list(&project),
+            "conda: numpy>=1.26, scipy, pandas 2.2.*"
+        );
+    }
 }
