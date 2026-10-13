@@ -110,6 +110,12 @@ pub async fn assess<S: MetadataSource>(
         findings.extend(crate::core::depcheck::check(&venv.path, venv.python));
     }
 
+    // pixi: PyPI dependencies that exclude the environment's Python, named
+    // with the `pixi add python=…` that fixes them (core::pixi_compat).
+    if let Some(pixi) = crate::core::pixi::detect(workspace) {
+        findings.extend(crate::core::pixi_compat::assess_default_env(&pixi, source).await);
+    }
+
     // F3's hybrid confirmation: metadata explains which package would be the
     // blocker; a real `uv --dry-run` resolve confirms the answer is actually
     // installable, catching version conflicts wheel-tag analysis can't see
