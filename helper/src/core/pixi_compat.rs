@@ -445,6 +445,8 @@ mod tests {
                 has_platform_wheels: true,
                 sdist_only: false,
                 has_foreign_wheels: false,
+                no_files_for_platform: false,
+                wheel_platforms: Vec::new(),
                 requires_python: Some(">=3.9".into()),
             }],
             unresolved: Vec::new(),

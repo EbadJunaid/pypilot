@@ -43,7 +43,8 @@ pub struct CompatReport {
     pub unresolved: Vec<(String, String)>,
     /// Intersection of every resolved package's supported set.
     pub intersection: PyVersionSet,
-    /// Populated only when `intersection` is empty.
+    /// Populated only when `intersection` is empty, and only from packages
+    /// that do have files for this platform.
     pub conflicts: Vec<ConflictPair>,
     /// One-line, OS-neutral summaries of packages that will build from source
     /// (sdist-only) on this platform. The solver turns `per_package` into the
@@ -60,6 +61,11 @@ impl CompatReport {
     /// Is a given interpreter compatible with the whole dependency set?
     pub fn is_compatible(&self, py: PyVersion) -> bool {
         !self.intersection.is_empty() && self.intersection.contains(py)
+    }
+
+    /// Releases that publish nothing installable on this platform.
+    pub fn uninstallable(&self) -> impl Iterator<Item = &PackageAnalysis> {
+        self.per_package.iter().filter(|p| p.no_files_for_platform)
     }
 
     /// Which packages exclude a given interpreter (for "why 3.13 won't work").
@@ -158,8 +164,21 @@ pub async fn analyze<S: MetadataSource>(
         .reduce(|acc, s| acc.intersect(&s))
         .unwrap_or_else(PyVersionSet::universe);
 
-    let conflicts = if intersection.is_empty() && per_package.len() >= 2 {
-        find_conflicts(&per_package)
+    // A release with no files for this platform empties the intersection on
+    // its own; that is its own finding (see `PackageAnalysis::no_files_message`),
+    // not a version conflict. Look for conflicts among the rest only.
+    let installable: Vec<PackageAnalysis> = per_package
+        .iter()
+        .filter(|p| !p.no_files_for_platform)
+        .cloned()
+        .collect();
+    let rest_empty = installable
+        .iter()
+        .map(|p| p.supported.clone())
+        .reduce(|acc, s| acc.intersect(&s))
+        .is_some_and(|s| s.is_empty());
+    let conflicts = if rest_empty && installable.len() >= 2 {
+        find_conflicts(&installable)
     } else {
         Vec::new()
     };
@@ -315,5 +334,39 @@ mod tests {
         let c = &report.conflicts[0];
         assert!(c.explanation.contains("legacy"));
         assert!(c.explanation.contains("shiny"));
+    }
+
+    #[tokio::test]
+    async fn platformless_release_is_not_a_version_conflict() {
+        let mut src = FixtureSource::new();
+        // Windows wheels only, no sdist: nothing installs on Linux.
+        src.insert(
+            "winonly",
+            pkg(
+                "winonly",
+                Some(">=3.9"),
+                vec![wheel("winonly-1.0-cp312-cp312-win_amd64.whl")],
+            ),
+        );
+        src.insert(
+            "fine",
+            pkg(
+                "fine",
+                Some(">=3.9"),
+                vec![wheel("fine-1.0-py3-none-any.whl")],
+            ),
+        );
+
+        let report = analyze(
+            &src,
+            linux(),
+            &[Requirement::any("winonly"), Requirement::any("fine")],
+        )
+        .await;
+
+        assert!(report.intersection.is_empty());
+        assert!(report.conflicts.is_empty());
+        let names: Vec<&str> = report.uninstallable().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["winonly"]);
     }
 }

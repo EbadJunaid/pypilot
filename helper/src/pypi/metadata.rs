@@ -138,6 +138,14 @@ pub struct PackageAnalysis {
     /// authors build binaries for other platforms, so the sdist needs a
     /// compiler.
     pub has_foreign_wheels: bool,
+    /// True if the release ships wheels for other platforms only and no
+    /// sdist, so nothing in it installs here at any Python version.
+    /// `supported` is then empty. (A release with no files at all is not
+    /// flagged: there is nothing to say about which platforms it targets.)
+    pub no_files_for_platform: bool,
+    /// The platforms the release's wheels do target (`Linux x64`, `macOS`),
+    /// for explaining `no_files_for_platform`. Empty when it is not set.
+    pub wheel_platforms: Vec<String>,
     /// The `requires_python` string that was in effect (for messaging).
     pub requires_python: Option<String>,
 }
@@ -151,6 +159,10 @@ impl PackageMetadata {
     ///   wheels' supported minors — this is what catches the "no cp313 wheel" case.
     /// * If there are no platform wheels but an sdist exists, keep the
     ///   `requires_python` set and flag `sdist_only` (compiles from source).
+    /// * If there are wheels, none for this platform, and no sdist, nothing
+    ///   installs here: the set is empty and `no_files_for_platform` is set.
+    /// * With no files at all, keep `requires_python`: there is no evidence
+    ///   either way, and an empty set would blame the wrong thing.
     pub fn analyze(&self, platform: &Platform) -> PackageAnalysis {
         let declared = self
             .info
@@ -163,6 +175,7 @@ impl PackageMetadata {
         let mut has_platform_wheels = false;
         let mut has_any_wheel = false;
         let mut has_sdist = false;
+        let mut foreign_platforms: Vec<String> = Vec::new();
 
         for file in &self.urls {
             if file.yanked {
@@ -175,6 +188,12 @@ impl PackageMetadata {
                     if !s.is_empty() {
                         has_platform_wheels = true;
                         wheel_union = wheel_union.union(&s);
+                    } else {
+                        for label in tags.platform.iter().map(|t| platform_label(t)) {
+                            if !foreign_platforms.contains(&label) {
+                                foreign_platforms.push(label);
+                            }
+                        }
                     }
                 }
             } else if file.is_sdist() {
@@ -182,19 +201,22 @@ impl PackageMetadata {
             }
         }
 
+        let sdist_only = !has_platform_wheels && has_sdist;
+        let has_foreign_wheels = has_any_wheel && !has_platform_wheels;
+        let no_files_for_platform = has_foreign_wheels && !has_sdist;
+
         let supported = if has_platform_wheels {
             declared.intersect(&wheel_union)
+        } else if no_files_for_platform {
+            // Only other platforms' wheels: no Python can install it here.
+            PyVersionSet::empty()
         } else {
-            // No usable wheels: either sdist-only (compile) or nothing. Either way
-            // the interpreter constraint is whatever requires_python says.
+            // sdist-only (compiles from source) or no files at all: the
+            // interpreter constraint is whatever requires_python says.
             declared
         };
 
-        let sdist_only = !has_platform_wheels && has_sdist;
-        // If a package has wheels but none for this platform and no sdist, that's
-        // still surfaced via has_platform_wheels=false + empty wheel_union, but we
-        // fall back to requires_python so we don't wrongly claim zero support.
-        let has_foreign_wheels = has_any_wheel && !has_platform_wheels;
+        foreign_platforms.sort();
 
         PackageAnalysis {
             name: self.info.name.clone(),
@@ -203,12 +225,66 @@ impl PackageMetadata {
             has_platform_wheels,
             sdist_only,
             has_foreign_wheels,
+            no_files_for_platform,
+            wheel_platforms: if no_files_for_platform {
+                foreign_platforms
+            } else {
+                Vec::new()
+            },
             requires_python: self.info.requires_python.clone(),
         }
     }
 }
 
+/// Human name for a wheel platform tag: `manylinux_2_17_x86_64` is `Linux x64`.
+/// Unrecognised tags are shown as they are.
+fn platform_label(tag: &str) -> String {
+    let arch = if tag.ends_with("x86_64") || tag.ends_with("amd64") {
+        " x64"
+    } else if tag.ends_with("aarch64") || tag.ends_with("arm64") {
+        " arm64"
+    } else if tag.ends_with("i686") || tag == "win32" {
+        " x86"
+    } else {
+        ""
+    };
+    let os =
+        if tag.starts_with("manylinux") || tag.starts_with("musllinux") || tag.starts_with("linux")
+        {
+            "Linux"
+        } else if tag.starts_with("win") {
+            "Windows"
+        } else if tag.starts_with("macosx") {
+            // Universal and fat builds span arches; the OS is what matters.
+            return "macOS".to_string();
+        } else {
+            return tag.to_string();
+        };
+    format!("{os}{arch}")
+}
+
 impl PackageAnalysis {
+    /// The user-facing reason this release cannot be installed on `here`,
+    /// when `no_files_for_platform` is set.
+    pub fn no_files_message(&self, here: &str) -> Option<String> {
+        if !self.no_files_for_platform {
+            return None;
+        }
+        // Wheels tagged for this platform that still don't count are for
+        // another interpreter (PyPy, GraalPy).
+        let only = if self.wheel_platforms.is_empty()
+            || self.wheel_platforms.iter().any(|p| p == here || p == "any")
+        {
+            "none of its wheels are for CPython".to_string()
+        } else {
+            format!("only {} wheels", self.wheel_platforms.join(", "))
+        };
+        Some(format!(
+            "{} {} publishes no files for {here} ({only}, no source distribution), so it cannot be installed here.",
+            self.name, self.version
+        ))
+    }
+
     /// How the sdist fallback builds, or `None` when wheels cover this
     /// platform (or there is no sdist to fall back to).
     pub fn sdist_kind(&self) -> Option<SdistKind> {
@@ -356,5 +432,107 @@ mod tests {
         // 3.7 is excluded by requires_python itself, not by a missing wheel.
         assert!(!a.lacks_wheel_for(PyVersion::py3(7)));
         assert!(!a.lacks_wheel_for(PyVersion::py3(12)));
+    }
+
+    fn windows() -> Platform {
+        Platform {
+            os: Os::Windows,
+            arch: Arch::X86_64,
+        }
+    }
+
+    /// tensorflow 2.15.0.post1: manylinux x86_64 wheels only, no sdist.
+    fn linux_only_release() -> PackageMetadata {
+        PackageMetadata {
+            info: Info {
+                name: "tensorflow".into(),
+                version: "2.15.0.post1".into(),
+                requires_python: Some(">=3.9".into()),
+            },
+            urls: vec![
+                wheel("tensorflow-2.15.0.post1-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+                wheel("tensorflow-2.15.0.post1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+            ],
+            versions: vec!["2.15.0.post1".into()],
+        }
+    }
+
+    #[test]
+    fn foreign_wheels_without_sdist_support_nothing_here() {
+        let a = linux_only_release().analyze(&windows());
+        assert!(a.no_files_for_platform);
+        assert!(a.supported.is_empty());
+        assert!(!a.sdist_only);
+        assert_eq!(a.sdist_kind(), None);
+        assert_eq!(a.wheel_platforms, vec!["Linux x64".to_string()]);
+        assert_eq!(
+            a.no_files_message(windows().label()).unwrap(),
+            "tensorflow 2.15.0.post1 publishes no files for Windows x64 (only Linux x64 wheels, no source distribution), so it cannot be installed here."
+        );
+        // Nothing is missing a wheel for one Python: nothing installs at all.
+        assert!(!a.lacks_wheel_for(PyVersion::py3(11)));
+    }
+
+    #[test]
+    fn the_same_release_is_fine_where_its_wheels_are() {
+        let a = linux_only_release().analyze(&linux());
+        assert!(!a.no_files_for_platform);
+        assert!(a.wheel_platforms.is_empty());
+        assert_eq!(a.no_files_message(linux().label()), None);
+        assert!(a.supported.contains(PyVersion::py3(11)));
+    }
+
+    #[test]
+    fn foreign_wheels_with_sdist_stay_a_source_build() {
+        let mut meta = linux_only_release();
+        meta.urls.push(sdist("tensorflow-2.15.0.post1.tar.gz"));
+        let a = meta.analyze(&windows());
+        assert!(!a.no_files_for_platform);
+        assert!(a.sdist_only);
+        assert!(a.supported.contains(PyVersion::py3(12)));
+    }
+
+    #[test]
+    fn no_files_at_all_keeps_requires_python() {
+        let mut meta = linux_only_release();
+        meta.urls.clear();
+        let a = meta.analyze(&windows());
+        assert!(!a.no_files_for_platform);
+        assert!(!a.sdist_only);
+        assert!(a.supported.contains(PyVersion::py3(12)));
+        assert!(!a.supported.contains(PyVersion::py3(8)));
+    }
+
+    #[test]
+    fn yanked_sdist_does_not_count() {
+        let mut meta = linux_only_release();
+        let mut yanked = sdist("tensorflow-2.15.0.post1.tar.gz");
+        yanked.yanked = true;
+        meta.urls.push(yanked);
+        assert!(meta.analyze(&windows()).no_files_for_platform);
+    }
+
+    #[test]
+    fn wheel_platform_labels() {
+        let mut meta = linux_only_release();
+        meta.urls = vec![
+            wheel("x-1.0-cp312-cp312-macosx_11_0_arm64.whl"),
+            wheel("x-1.0-cp312-cp312-macosx_10_9_universal2.whl"),
+            wheel("x-1.0-cp312-cp312-manylinux_2_17_aarch64.whl"),
+        ];
+        let a = meta.analyze(&windows());
+        assert_eq!(a.wheel_platforms, vec!["Linux arm64", "macOS"]);
+    }
+
+    #[test]
+    fn pypy_only_wheels_say_so() {
+        let mut meta = linux_only_release();
+        meta.urls = vec![wheel("x-1.0-pp310-pypy310_pp73-win_amd64.whl")];
+        let a = meta.analyze(&windows());
+        assert!(a.no_files_for_platform);
+        assert!(a
+            .no_files_message(windows().label())
+            .unwrap()
+            .contains("none of its wheels are for CPython"));
     }
 }

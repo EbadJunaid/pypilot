@@ -85,6 +85,18 @@ impl Platform {
         }
     }
 
+    /// Human name for messages, e.g. `Windows x64`, `macOS arm64`.
+    pub fn label(&self) -> &'static str {
+        match (self.os, self.arch) {
+            (Os::Linux, Arch::X86_64) => "Linux x64",
+            (Os::Linux, Arch::Aarch64) => "Linux arm64",
+            (Os::Macos, Arch::X86_64) => "macOS x64",
+            (Os::Macos, Arch::Aarch64) => "macOS arm64",
+            (Os::Windows, Arch::X86_64) => "Windows x64",
+            (Os::Windows, Arch::Aarch64) => "Windows arm64",
+        }
+    }
+
     /// Target triple used by uv's standalone release asset names.
     pub fn uv_triple(&self) -> &'static str {
         match (self.os, self.arch) {
