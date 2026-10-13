@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::core::command;
 use crate::core::installed;
-use crate::core::pixi::{self, PixiError};
+use crate::core::pixi;
+use crate::core::pixi_compat;
 use crate::core::setup::{SetupSummary, Step};
 use crate::pypi::pyversion::PyVersion;
 
@@ -153,7 +154,7 @@ pub async fn add_ipykernel(pixi: Option<&Path>, root: &Path, summary: &mut Setup
         },
         Err(e) => failed_step(
             step,
-            &format!("{e} (notebooks will not see this environment until ipykernel is installed)"),
+            &format!("{e} Notebooks will not see this environment until ipykernel is installed."),
         ),
     };
     summary.steps.push(detail);
@@ -171,7 +172,7 @@ fn located<'a>(pixi: Option<&'a Path>, summary: &mut SetupSummary) -> Option<&'a
 async fn run(pixi: &Path, args: &[String], root: &Path) -> Result<(), String> {
     match command::run(pixi, args, Some(root)).await {
         Ok(out) if out.success() => Ok(()),
-        Ok(out) => Err(explain_failure(&out.stderr)),
+        Ok(out) => Err(explain_failure(&out.stderr, root)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -198,36 +199,11 @@ fn failed_step(name: &str, detail: &str) -> Step {
     }
 }
 
-/// How long the raw pixi report may get in a step detail.
-const REPORT_LIMIT: usize = 400;
-
-/// One readable line for a failed pixi command, led by what
-/// [`pixi::classify_pixi_error`] made of it.
-pub fn explain_failure(stderr: &str) -> String {
-    let report = pixi::unwrap_report(stderr);
-    let report = report.trim_start_matches("Error:").trim();
-    let lead = match pixi::classify_pixi_error(stderr) {
-        PixiError::NoMatchingWheel { package, abi } => format!(
-            "{package} has no wheel for this environment's Python{}",
-            abi.map(|a| format!(" ({a})")).unwrap_or_default()
-        ),
-        PixiError::NotFound { package } => format!("{package} is not on PyPI"),
-        PixiError::Unsolvable => "pixi could not solve the environment".to_string(),
-        PixiError::Other => return clip(report),
-    };
-    if report.is_empty() {
-        lead
-    } else {
-        format!("{lead}. pixi said: {}", clip(report))
-    }
-}
-
-fn clip(text: &str) -> String {
-    if text.chars().count() <= REPORT_LIMIT {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(REPORT_LIMIT).collect();
-    format!("{cut}…")
+/// One paragraph for a failed pixi command run on the project at `root`:
+/// what went wrong and what to run next, worded as doctor words it
+/// ([`pixi_compat::explain_pixi_error`]).
+pub fn explain_failure(stderr: &str, root: &Path) -> String {
+    pixi_compat::explain_pixi_error(stderr, pixi::detect(root).as_ref())
 }
 
 #[cfg(test)]
@@ -310,25 +286,20 @@ mod tests {
     }
 
     #[test]
-    fn failures_are_explained() {
+    fn failures_are_explained_as_doctor_explains_them() {
+        let root = Path::new("no-pixi-project-here");
+        for stderr in [
+            include_str!("../../tests/fixtures/pixi/pixi-0.81-err-no-wheel.txt"),
+            include_str!("../../tests/fixtures/pixi/pixi-0.81-err-not-found.txt"),
+            include_str!("../../tests/fixtures/pixi/pixi-0.81-err-conda-conflict.txt"),
+            "Error: network unreachable",
+        ] {
+            assert_eq!(
+                explain_failure(stderr, root),
+                pixi_compat::explain_pixi_error(stderr, None)
+            );
+        }
         let no_wheel = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-no-wheel.txt");
-        let text = explain_failure(no_wheel);
-        assert!(
-            text.starts_with(
-                "tensorflow has no wheel for this environment's Python (cp312). pixi said: "
-            ),
-            "{text}"
-        );
-        let not_found = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-not-found.txt");
-        assert!(explain_failure(not_found)
-            .starts_with("definitely-not-a-real-package-xyz is not on PyPI"));
-        let conflict = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-conda-conflict.txt");
-        let text = explain_failure(conflict);
-        assert!(text.starts_with("pixi could not solve the environment"));
-        assert!(text.chars().count() <= REPORT_LIMIT + 80);
-        assert_eq!(
-            explain_failure("Error: network unreachable"),
-            "network unreachable"
-        );
+        assert!(explain_failure(no_wheel, root).contains("`pixi add python=3.11`"));
     }
 }
