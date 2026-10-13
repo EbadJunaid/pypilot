@@ -3,13 +3,163 @@
 //! When `pixi add --pypi` or `pixi install` fails, pixi relays uv's resolver
 //! verdict ("has no wheels with a matching Python ABI tag (e.g., `cp312`)")
 //! without saying which Python the package *does* support or how to switch
-//! (prefix-dev/pixi#5230, #5752, #5266). [`explain_pixi_error`] turns that
-//! stderr into one paragraph with a next step.
+//! (prefix-dev/pixi#5230, #5752, #5266). [`assess_pixi`] predicts that failure
+//! from PyPI metadata before it happens; [`explain_pixi_error`] turns the stderr
+//! of one that did into one paragraph with a next step.
 
 use crate::core::pixi::{self, ManifestFormat, PixiError, PixiProject};
+use crate::core::platform::{Os, Platform};
 use crate::core::project::normalize_name;
+use crate::core::{Finding, FixKind, Severity};
 use crate::matrix;
-use crate::pypi::{CompatReport, PyVersion, PyVersionSet};
+use crate::pypi::{self, CompatReport, MetadataSource, PyVersion, PyVersionSet};
+
+/// Check a pixi project's default-environment PyPI dependencies against the
+/// Python pixi gives that environment, so a `pixi install` that would fail on
+/// "no wheels with a matching Python ABI tag" is caught, with the fix, first.
+///
+/// The Python is `env_python` (what `.pixi/envs/default` has installed) when
+/// known, else the manifest's pin read by [`pixi::python_minor_hint`]. No
+/// finding when everything fits or no Python can be determined.
+///
+/// Conda dependencies are deliberately not checked here: conda-forge builds
+/// each package per Python and pixi's conda solver picks `python` together
+/// with them, so PyPI wheel tags say nothing about them, and a clash among
+/// them shows up in pixi's own solve ([`explain_pixi_error`] covers that).
+/// PyPI names that fail to resolve are left to the generic dependency check,
+/// so they are not reported twice.
+pub async fn assess_pixi<S: MetadataSource>(
+    project: &PixiProject,
+    env_python: Option<PyVersion>,
+    source: &S,
+    platform: Platform,
+) -> Vec<Finding> {
+    if project.pypi_deps.is_empty() {
+        return Vec::new();
+    }
+    let report = pypi::analyze(source, platform, &project.pypi_deps).await;
+    pixi_findings(project, env_python, &report)
+}
+
+/// [`assess_pixi`] for the project's installed default environment, if any.
+pub async fn assess_default_env<S: MetadataSource>(
+    project: &PixiProject,
+    source: &S,
+) -> Vec<Finding> {
+    let env_python = pixi::env(project, pixi::DEFAULT_ENV).and_then(|e| e.python_version);
+    assess_pixi(project, env_python, source, Platform::current()).await
+}
+
+/// The pure half of [`assess_pixi`]: findings from a finished analysis.
+pub fn pixi_findings(
+    project: &PixiProject,
+    env_python: Option<PyVersion>,
+    report: &CompatReport,
+) -> Vec<Finding> {
+    let skipped = skipped_note(project.skipped_pypi_deps);
+
+    if report.intersection.is_empty() {
+        let why = report.conflicts.first().map_or_else(
+            || "The PyPI dependencies have no common supported Python version.".to_string(),
+            |c| c.explanation.clone(),
+        );
+        return vec![Finding {
+            severity: Severity::Error,
+            title: "pixi's PyPI dependencies conflict on Python version".to_string(),
+            detail: format!(
+                "{why} pixi cannot pick one Python for the environment, so `pixi add python=…` will not help; change or drop one of these PyPI dependencies.{skipped}"
+            ),
+            fix: FixKind::Manual,
+        }];
+    }
+
+    let (python, from) = match env_python {
+        Some(py) => (py, format!("The pixi environment runs Python {py}")),
+        None => {
+            let Some(py) = pixi::python_minor_hint(project) else {
+                return Vec::new();
+            };
+            let file = project
+                .manifest
+                .file_name()
+                .map_or_else(|| "pixi.toml".into(), |f| f.to_string_lossy());
+            let spec = project.python.as_deref().unwrap_or_default();
+            (py, format!("{file} sets python to `{spec}` (Python {py})"))
+        }
+    };
+    // A Python outside the tracked range can't be judged from wheel tags.
+    if !PyVersionSet::universe().contains(python) || report.is_compatible(python) {
+        return Vec::new();
+    }
+    let blockers = report.blockers_for(python);
+    let Some(target) = report.suggested_python() else {
+        return Vec::new();
+    };
+
+    let os = os_name(report.platform.os);
+    let reasons: Vec<String> = blockers
+        .iter()
+        .map(|p| {
+            if p.lacks_wheel_for(python) {
+                format!(
+                    "{} {} ships no Python {python} wheel for {os} (its wheels cover {})",
+                    p.name,
+                    p.version,
+                    p.supported.to_range_string()
+                )
+            } else {
+                let declared = p
+                    .requires_python
+                    .as_deref()
+                    .map(|rp| format!(", requires_python `{rp}`"))
+                    .unwrap_or_default();
+                format!(
+                    "{} {} supports Python {}{declared}",
+                    p.name,
+                    p.version,
+                    p.supported.to_range_string()
+                )
+            }
+        })
+        .collect();
+    let consequence = if blockers.iter().any(|p| p.lacks_wheel_for(python)) {
+        "`pixi install` fails with \"no wheels with a matching Python ABI tag\" unless it can build from source."
+    } else {
+        "`pixi install` cannot install it on this Python."
+    };
+    let names: Vec<&str> = blockers.iter().map(|p| p.name.as_str()).collect();
+    let verb = if names.len() == 1 { "does" } else { "do" };
+
+    vec![Finding {
+        severity: Severity::Error,
+        title: format!(
+            "{} {verb} not support Python {python} in this pixi environment",
+            names.join(", ")
+        ),
+        detail: format!(
+            "{from}, but {}. {consequence} Run `pixi add python={target}` to move the environment to Python {target}, the newest version every PyPI dependency supports.{skipped}",
+            reasons.join("; ")
+        ),
+        fix: FixKind::Manual,
+    }]
+}
+
+/// " 2 PyPI dependencies given as git, path or url were not checked."
+fn skipped_note(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " 1 PyPI dependency given as git, path or url was not checked.".to_string(),
+        n => format!(" {n} PyPI dependencies given as git, path or url were not checked."),
+    }
+}
+
+fn os_name(os: Os) -> &'static str {
+    match os {
+        Os::Windows => "Windows",
+        Os::Macos => "macOS",
+        Os::Linux => "Linux",
+    }
+}
 
 /// Explain the stderr of a failed `pixi add` / `pixi install` in one paragraph
 /// that ends with what to do next.
@@ -369,5 +519,155 @@ mod tests {
             "pixi failed: could not reach https://conda.anaconda.org"
         );
         assert!(explain_pixi_error("", None).starts_with("pixi failed without an error message"));
+    }
+
+    // --- assess_pixi ---
+
+    use crate::core::platform::Arch;
+    use crate::pypi::metadata::{DistFile, Info, PackageMetadata};
+    use crate::pypi::FixtureSource;
+
+    fn linux() -> Platform {
+        Platform {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        }
+    }
+
+    fn pkg(name: &str, rp: Option<&str>, wheels: &[&str]) -> PackageMetadata {
+        PackageMetadata {
+            info: Info {
+                name: name.into(),
+                version: "1.0".into(),
+                requires_python: rp.map(str::to_string),
+            },
+            urls: wheels
+                .iter()
+                .map(|w| DistFile {
+                    filename: w.to_string(),
+                    packagetype: "bdist_wheel".into(),
+                    requires_python: None,
+                    yanked: false,
+                })
+                .collect(),
+            versions: vec!["1.0".into()],
+        }
+    }
+
+    /// Wheels for linux x86_64 on each listed CPython minor.
+    fn cp_wheels(name: &str, minors: &[u8]) -> Vec<String> {
+        minors
+            .iter()
+            .map(|m| format!("{name}-1.0-cp3{m}-cp3{m}-manylinux_2_17_x86_64.whl"))
+            .collect()
+    }
+
+    fn source() -> FixtureSource {
+        let mut src = FixtureSource::new();
+        src.insert(
+            "requests",
+            pkg(
+                "requests",
+                Some(">=3.8"),
+                &["requests-1.0-py3-none-any.whl"],
+            ),
+        );
+        let tf = cp_wheels("tensorflow", &[9, 10, 11]);
+        let tf: Vec<&str> = tf.iter().map(String::as_str).collect();
+        src.insert("tensorflow", pkg("tensorflow", Some(">=3.9"), &tf));
+        let legacy = cp_wheels("legacy", &[8, 9, 10]);
+        let legacy: Vec<&str> = legacy.iter().map(String::as_str).collect();
+        src.insert("legacy", pkg("legacy", Some(">=3.8"), &legacy));
+        let shiny = cp_wheels("shiny", &[11, 12]);
+        let shiny: Vec<&str> = shiny.iter().map(String::as_str).collect();
+        src.insert("shiny", pkg("shiny", Some(">=3.11"), &shiny));
+        src
+    }
+
+    fn manifest(python: &str, pypi: &str) -> PixiProject {
+        project(&format!(
+            "[workspace]\nname = \"p\"\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\npython = \"{python}\"\nnumpy = \">=1.26\"\n\n[pypi-dependencies]\n{pypi}\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn compatible_project_has_no_finding() {
+        // numpy is a conda dependency, so it is not checked against PyPI.
+        let proj = manifest("3.12.*", "requests = \"*\"");
+        assert!(proj.pypi_deps.iter().all(|r| r.name != "numpy"));
+        assert!(assess_pixi(&proj, None, &source(), linux())
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn names_the_package_and_the_python_to_switch_to() {
+        let proj = manifest("3.12.*", "requests = \"*\"\ntensorflow = \"*\"");
+        let findings = assess_pixi(&proj, None, &source(), linux()).await;
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(
+            f.title,
+            "tensorflow does not support Python 3.12 in this pixi environment"
+        );
+        assert_eq!(
+            f.detail,
+            "pixi.toml sets python to `3.12.*` (Python 3.12), but tensorflow 1.0 ships no Python 3.12 wheel for Linux (its wheels cover 3.9–3.11). `pixi install` fails with \"no wheels with a matching Python ABI tag\" unless it can build from source. Run `pixi add python=3.11` to move the environment to Python 3.11, the newest version every PyPI dependency supports."
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_python_wins_over_the_manifest() {
+        let proj = manifest("3.11.*", "tensorflow = \"*\"");
+        assert!(assess_pixi(&proj, None, &source(), linux())
+            .await
+            .is_empty());
+        let findings = assess_pixi(&proj, Some(PyVersion::py3(12)), &source(), linux()).await;
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0]
+            .detail
+            .starts_with("The pixi environment runs Python 3.12, but tensorflow"));
+    }
+
+    #[tokio::test]
+    async fn requires_python_blocker_is_worded_as_such() {
+        let proj = manifest("3.10.*", "shiny = \"*\"");
+        let findings = assess_pixi(&proj, None, &source(), linux()).await;
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].detail.contains(
+                "shiny 1.0 supports Python 3.11–3.12, requires_python `>=3.11`. `pixi install` cannot install it on this Python. Run `pixi add python=3.12`"
+            ),
+            "{}",
+            findings[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_pair_is_named() {
+        let proj = manifest(
+            "3.12.*",
+            "legacy = \"*\"\nshiny = \"*\"\nlocal = { path = \"./local\" }",
+        );
+        let findings = assess_pixi(&proj, None, &source(), linux()).await;
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(
+            f.title,
+            "pixi's PyPI dependencies conflict on Python version"
+        );
+        assert_eq!(
+            f.detail,
+            "legacy supports up to Python 3.10 but shiny requires at least Python 3.11 — no single interpreter satisfies both. pixi cannot pick one Python for the environment, so `pixi add python=…` will not help; change or drop one of these PyPI dependencies. 1 PyPI dependency given as git, path or url was not checked."
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_python_gives_no_finding() {
+        let proj = manifest("*", "tensorflow = \"*\"");
+        assert!(assess_pixi(&proj, None, &source(), linux())
+            .await
+            .is_empty());
     }
 }
