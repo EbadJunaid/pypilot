@@ -199,9 +199,9 @@ pub fn parse_requires_python(spec: &str) -> PyVersionSet {
 
 /// One comparator clause from a specifier, e.g. `>=3.8` or `~=3.9` or `!=3.10.*`.
 ///
-/// Shared with [`crate::pypi::version`], which applies the same grammar to
-/// package versions rather than interpreter versions. The comparison rules are
-/// identical; only the meaning of the numbers differs.
+/// Interpreter versions are plain release numbers, so this only compares
+/// release segments. Package versions need the full PEP 440 rules (pre-, post-
+/// and dev-releases); [`crate::pypi::version`] has its own clause for those.
 pub(crate) struct Clause {
     op: Op,
     version: Vec<u64>,
