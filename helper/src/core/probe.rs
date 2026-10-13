@@ -7,20 +7,42 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::env::{self, EnvKind, ProjectEnv};
 use crate::core::interpreter::{self, Interpreter};
 use crate::core::uv::{self, UvInfo};
 use crate::pypi::pyversion::PyVersion;
 use crate::settings::Settings;
 
-/// A discovered virtual environment.
+/// The project's environment: a virtual environment, or the pixi prefix of a
+/// pixi project (see [`crate::core::env`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VenvInfo {
     pub path: PathBuf,
-    /// Interpreter version recorded in `pyvenv.cfg`, if parseable.
+    /// Interpreter version recorded in `pyvenv.cfg` (or a pixi prefix's
+    /// `conda-meta/`), if parseable.
     pub python: Option<PyVersion>,
-    /// The interpreter the venv depends on that is gone from disk, when the
-    /// venv can no longer run (see [`missing_interpreter`]).
+    /// The interpreter the environment depends on that is gone from disk,
+    /// when it can no longer run (see [`missing_interpreter`]).
     pub broken: Option<PathBuf>,
+    pub kind: EnvKind,
+}
+
+impl VenvInfo {
+    /// The environment's own interpreter.
+    pub fn python_exe(&self) -> PathBuf {
+        env::python_in(&self.kind, &self.path)
+    }
+}
+
+impl From<ProjectEnv> for VenvInfo {
+    fn from(e: ProjectEnv) -> VenvInfo {
+        VenvInfo {
+            path: e.path,
+            python: e.python,
+            broken: e.broken,
+            kind: e.kind,
+        }
+    }
 }
 
 /// Everything the fast probe phase learned about the environment.
@@ -46,20 +68,12 @@ pub async fn run(workspace: &Path, settings: &Settings) -> Probes {
     }
 }
 
-/// Look for a `.venv` (or `venv`) directory with a `pyvenv.cfg`.
+/// The project's environment: its pixi prefix in a pixi project, else a
+/// `.venv` (or `venv`, `env`) directory with a `pyvenv.cfg`.
 async fn detect_venv(workspace: &Path) -> Option<VenvInfo> {
-    for name in [".venv", "venv", "env"] {
-        let dir = workspace.join(name);
-        let cfg = dir.join("pyvenv.cfg");
-        if let Ok(text) = tokio::fs::read_to_string(&cfg).await {
-            return Some(VenvInfo {
-                broken: missing_interpreter(&dir, &text),
-                path: dir,
-                python: parse_pyvenv_version(&text),
-            });
-        }
-    }
-    None
+    env::project_env_resolved(workspace)
+        .await
+        .map(VenvInfo::from)
 }
 
 /// [`missing_interpreter`] for `venv`, reading its `pyvenv.cfg`. `None` when

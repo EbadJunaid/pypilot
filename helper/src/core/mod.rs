@@ -7,6 +7,7 @@
 
 pub mod command;
 pub mod depcheck;
+pub mod env;
 pub mod gpu;
 pub mod guardian;
 pub mod imports;

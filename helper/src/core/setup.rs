@@ -730,6 +730,7 @@ mod tests {
             path: PathBuf::from("ws").join(dir),
             python: Some(PyVersion::py3(12)),
             broken: broken.map(PathBuf::from),
+            kind: Default::default(),
         };
 
         let a = assessment(Some(venv(".venv", Some("/gone/python3.12"))));
