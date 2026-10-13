@@ -390,7 +390,11 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
         findings
     };
 
-    let published: Vec<Diagnostic> = findings.iter().map(diagnostics::to_diagnostic).collect();
+    let pixi = crate::core::pixi::detect(&root).is_some();
+    let published: Vec<Diagnostic> = findings
+        .iter()
+        .map(|f| diagnostics::to_diagnostic_in(f, pixi))
+        .collect();
     {
         // Closed while the analysis ran: storing would leak the entry and
         // publishing would bring back squiggles did_close just cleared.

@@ -34,6 +34,10 @@ pub const CMD_RECREATE: &str = "pypilot.recreateWithPython";
 pub struct FixData {
     pub package: String,
     pub action: FixAction,
+    /// The fix runs through pixi (`pixi add --pypi`, `pixi add python=…`),
+    /// so its title says so. Absent from older payloads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pixi: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,8 +56,15 @@ pub enum FixAction {
     None,
 }
 
-/// Build the diagnostic for one finding.
+/// Build the diagnostic for one finding outside a pixi project.
+#[cfg(test)]
 pub fn to_diagnostic(finding: &Finding) -> Diagnostic {
+    to_diagnostic_in(finding, false)
+}
+
+/// Build the diagnostic for one finding; `pixi` when the project is pixi's,
+/// so its fixes run (and are titled) through pixi.
+pub fn to_diagnostic_in(finding: &Finding, pixi: bool) -> Diagnostic {
     let provides = if finding.renamed {
         format!(" (provides `{}`)", finding.import.module)
     } else {
@@ -171,6 +182,7 @@ pub fn to_diagnostic(finding: &Finding) -> Diagnostic {
     let data = serde_json::to_value(FixData {
         package: finding.package.clone(),
         action,
+        pixi,
     })
     .ok();
 
@@ -234,8 +246,20 @@ impl FixKey {
     }
 
     /// The action title for installing `what`, which is either one quoted name
-    /// or a phrase like "3 packages: numpy, pandas, requests".
-    fn title(&self, what: &str) -> String {
+    /// or a phrase like "3 packages: numpy, pandas, requests". In a pixi
+    /// project every fix is a pixi command, and the title says so.
+    fn title(&self, what: &str, pixi: bool) -> String {
+        if pixi {
+            return match self {
+                FixKey::Install => format!("Add {what} with pixi"),
+                FixKey::Create { python } => {
+                    format!("Install the pixi environment on Python {python} and add {what}")
+                }
+                FixKey::Recreate { python, .. } => {
+                    format!("Move the pixi environment to Python {python} and add {what}")
+                }
+            };
+        }
         match self {
             FixKey::Install => format!("Install {what}"),
             FixKey::Create { python } => {
@@ -292,6 +316,7 @@ impl FixKey {
 /// Automatable fixes sharing one [`FixKey`], each package listed once.
 struct Group<'a> {
     key: FixKey,
+    pixi: bool,
     packages: Vec<String>,
     diagnostics: Vec<&'a Diagnostic>,
 }
@@ -329,6 +354,7 @@ fn groups(diagnostics: &[Diagnostic]) -> Vec<Group<'_>> {
             None => {
                 groups.push(Group {
                     key,
+                    pixi: fix.pixi,
                     packages: Vec::new(),
                     diagnostics: Vec::new(),
                 });
@@ -430,7 +456,7 @@ pub fn code_actions_in(
             name_list(&group.packages)
         );
         actions.push(quick_fix(
-            caveated(group.key.title(&what), &group.packages, os),
+            caveated(group.key.title(&what, group.pixi), &group.packages, os),
             group.key.command(&group.packages),
             Some(group.diagnostics.iter().map(|d| (*d).clone()).collect()),
             actions.is_empty(),
@@ -450,7 +476,7 @@ pub fn code_actions_in(
         offered.push((key.clone(), name));
         actions.push(quick_fix(
             caveated(
-                key.title(&format!("`{}`", fix.package)),
+                key.title(&format!("`{}`", fix.package), fix.pixi),
                 std::slice::from_ref(&fix.package),
                 os,
             ),
@@ -473,7 +499,7 @@ pub fn code_actions_in(
             group.packages.len()
         );
         actions.push(quick_fix(
-            caveated(group.key.title(&what), &group.packages, os),
+            caveated(group.key.title(&what, group.pixi), &group.packages, os),
             group.key.command(&group.packages),
             None,
             false,
@@ -694,6 +720,42 @@ mod tests {
             .flatten()
             .map(|v| v.as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn pixi_projects_get_pixi_titles() {
+        let pixi_missing =
+            |p: &str| to_diagnostic_in(&finding(Problem::NotInstalled, p, false), true);
+        let actions = code_actions(&[pixi_missing("numpy"), pixi_missing("pandas")]);
+        assert_eq!(
+            unwrap(&actions[0]).title,
+            "Add 2 packages: numpy, pandas with pixi"
+        );
+        assert_eq!(unwrap(&actions[1]).title, "Add `numpy` with pixi");
+        assert_eq!(args(unwrap(&actions[1])), vec!["numpy"]);
+
+        let rebuild = to_diagnostic_in(
+            &finding(
+                Problem::IncompatibleInterpreter {
+                    current: PyVersion::py3(13),
+                    supported: supported(&[9, 10, 11, 12]),
+                    target: Some(PyVersion::py3(12)),
+                    reinstall_count: 3,
+                },
+                "mediapipe",
+                false,
+            ),
+            true,
+        );
+        assert_eq!(
+            unwrap(&code_actions(&[rebuild])[0]).title,
+            "Move the pixi environment to Python 3.12 and add `mediapipe`"
+        );
+
+        // Payloads from before the flag existed still decode, as non-pixi.
+        let mut old = missing("numpy");
+        old.data = Some(serde_json::json!({"package": "numpy", "action": {"kind": "install"}}));
+        assert_eq!(unwrap(&code_actions(&[old])[0]).title, "Install `numpy`");
     }
 
     #[test]
