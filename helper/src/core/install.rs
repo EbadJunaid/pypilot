@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::bail;
 
 use crate::core::setup::{self, SetupSummary, Step};
-use crate::core::{pip, torch_index, uv};
+use crate::core::{pip, pixi, pixi_manage, torch_index, uv};
 use crate::matrix;
 use crate::pypi::pyversion::PyVersion;
 use crate::settings::{ResolvedMode, Settings};
@@ -84,12 +84,12 @@ pub async fn install_packages(
     settings: &Settings,
     packages: &[String],
 ) -> crate::Result<SetupSummary> {
-    let mode = settings.resolve_mode().await;
+    let mode = settings.resolve_mode(workspace).await;
     let mut summary = SetupSummary {
         package_manager: settings.package_manager,
         resolved_mode: mode,
         python: None,
-        venv_path: workspace.join(".venv"),
+        venv_path: env_path(workspace, mode),
         why: format!("Installing {}.", packages.join(", ")),
         steps: Vec::new(),
         ok: true,
@@ -108,6 +108,25 @@ pub async fn install_packages(
     let batches = batch_by_index(solved);
 
     match mode {
+        ResolvedMode::Pixi => {
+            // pixi takes no per-command index, and PyPilot never writes uv's
+            // `[tool.uv]` index table into a pixi project. Say so rather than
+            // silently installing a different torch build than F2 matched.
+            if batches.iter().any(|b| b.index_url.is_some()) {
+                push(
+                    &mut summary,
+                    "GPU/CUDA index",
+                    true,
+                    "pixi project: installing from PyPI's default index. For a CUDA build, add the matched index under [pypi-options] in the pixi manifest, or take torch from conda-forge (pytorch-gpu).",
+                );
+            }
+            let all: Vec<String> = batches.into_iter().flat_map(|b| b.packages).collect();
+            let pixi = pixi::locate().await;
+            pixi_manage::add_pypi(pixi.as_deref(), workspace, &all, &mut summary).await;
+            if !summary.ok {
+                return Ok(summary);
+            }
+        }
         ResolvedMode::UvFull => {
             let uv_info = match uv::ensure(settings).await {
                 Ok(info) => info,
@@ -315,8 +334,8 @@ pub async fn recreate_with_python(
     version: PyVersion,
     packages: &[String],
 ) -> crate::Result<SetupSummary> {
-    let mode = settings.resolve_mode().await;
-    let venv_path = workspace.join(".venv");
+    let mode = settings.resolve_mode(workspace).await;
+    let venv_path = env_path(workspace, mode);
     let mut summary = SetupSummary {
         package_manager: settings.package_manager,
         resolved_mode: mode,
@@ -331,6 +350,15 @@ pub async fn recreate_with_python(
     };
 
     match mode {
+        ResolvedMode::Pixi => {
+            // The manifest's python spec decides the interpreter; pixi
+            // rebuilds the environment on it.
+            let pixi = pixi::locate().await;
+            pixi_manage::set_python(pixi.as_deref(), workspace, version, &mut summary).await;
+            if !summary.ok {
+                return Ok(summary);
+            }
+        }
         ResolvedMode::UvFull => {
             let uv_info = match uv::ensure(settings).await {
                 Ok(info) => info,
@@ -568,6 +596,15 @@ pub async fn recreate_with_python(
     summary.steps.extend(add.steps);
     summary.ok = summary.ok && add.ok;
     Ok(summary)
+}
+
+/// The environment a flow in `mode` works on: pixi's default prefix in a
+/// pixi project, `.venv` otherwise.
+fn env_path(workspace: &Path, mode: ResolvedMode) -> std::path::PathBuf {
+    match mode {
+        ResolvedMode::Pixi => pixi_manage::default_env_path(workspace),
+        _ => workspace.join(".venv"),
+    }
 }
 
 /// Append a package to requirements.txt, creating it if needed, skipping it if

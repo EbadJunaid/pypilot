@@ -11,6 +11,11 @@ use crate::core::project;
 
 pub async fn run(workspace: &Path) -> crate::Result<()> {
     let deps = project::scan(workspace);
+    if deps.is_pixi() {
+        anyhow::bail!(
+            "this is a pixi project; pixi manages its conda packages, so migrate-conda leaves it alone"
+        );
+    }
     if !deps.has_conda_env {
         anyhow::bail!("no environment.yml found in {}", workspace.display());
     }

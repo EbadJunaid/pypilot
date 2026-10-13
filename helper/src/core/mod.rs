@@ -17,6 +17,7 @@ pub mod interpreter;
 pub mod modules;
 pub mod pip;
 pub mod pixi;
+pub mod pixi_manage;
 pub mod platform;
 pub mod probe;
 pub mod project;

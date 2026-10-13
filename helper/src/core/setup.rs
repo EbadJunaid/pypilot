@@ -7,12 +7,15 @@
 //! pip mode: pick an already-installed interpreter for X.Y → `python -m venv` →
 //! `pip install`. If the required Python isn't installed, we stop with a clear
 //! "install Python X.Y" message (pip mode can't fetch interpreters).
+//!
+//! pixi projects: `pixi install`, and nothing else (see
+//! [`crate::core::pixi_manage`]). No `.venv`, no uv, no pip.
 
 use std::path::{Path, PathBuf};
 
 use crate::core::command::Output;
 use crate::core::solver;
-use crate::core::{installed, pip, project, uv};
+use crate::core::{env, installed, pip, pixi, pixi_manage, project, uv};
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::MetadataSource;
 use crate::settings::{PackageManager, ResolvedMode, Settings};
@@ -56,7 +59,7 @@ pub async fn run<S: MetadataSource>(
     settings: &Settings,
     source: &S,
 ) -> crate::Result<SetupSummary> {
-    let mode = settings.resolve_mode().await;
+    let mode = settings.resolve_mode(workspace).await;
     run_with_mode(workspace, settings, source, mode).await
 }
 
@@ -67,7 +70,36 @@ pub async fn run_with_mode<S: MetadataSource>(
     source: &S,
     mode: ResolvedMode,
 ) -> crate::Result<SetupSummary> {
+    // Whatever mode the caller picked, a pixi project is set up by pixi.
+    let mode = if pixi::detect(workspace).is_some() {
+        ResolvedMode::Pixi
+    } else {
+        mode
+    };
     let assessment = solver::assess(workspace, settings, source).await;
+
+    if mode == ResolvedMode::Pixi {
+        let mut summary = SetupSummary {
+            package_manager: settings.package_manager,
+            resolved_mode: mode,
+            python: None,
+            venv_path: pixi_manage::default_env_path(workspace),
+            why: "pixi project: the environment is installed by pixi from its manifest."
+                .to_string(),
+            steps: Vec::new(),
+            ok: true,
+        };
+        run_pixi(workspace, pixi::locate().await.as_deref(), &mut summary).await;
+        if assessment
+            .project
+            .packages
+            .iter()
+            .any(|r| r.name == "torch")
+        {
+            verify_gpu(workspace, &mut summary).await;
+        }
+        return Ok(summary);
+    }
 
     let venv_path = workspace.join(".venv");
     let mut summary = SetupSummary {
@@ -118,6 +150,8 @@ pub async fn run_with_mode<S: MetadataSource>(
             run_uv_pip_compat(workspace, settings, &assessment, &venv_path, &mut summary).await
         }
         ResolvedMode::PurePip => run_pip(workspace, &assessment, &venv_path, &mut summary).await,
+        // Returned early above.
+        ResolvedMode::Pixi => {}
     }
 
     ensure_ipykernel(workspace, settings, mode, &mut summary).await;
@@ -130,6 +164,32 @@ pub async fn run_with_mode<S: MetadataSource>(
         verify_gpu(workspace, &mut summary).await;
     }
     Ok(summary)
+}
+
+/// Set up a pixi project with the pixi binary at `pixi`: `pixi install`, then
+/// ipykernel when notebooks need it. With no pixi, a failed step that says so,
+/// and nothing on disk changes.
+pub(crate) async fn run_pixi(workspace: &Path, pixi: Option<&Path>, summary: &mut SetupSummary) {
+    pixi_manage::install(pixi, workspace, summary).await;
+    if let Some(env) = env::project_env(workspace) {
+        summary.python = env.python;
+        summary.venv_path = env.path;
+    }
+    ensure_pixi_ipykernel(workspace, pixi, summary).await;
+}
+
+/// [`ensure_ipykernel`] for a pixi project, with the pixi binary at `pixi`.
+async fn ensure_pixi_ipykernel(workspace: &Path, pixi: Option<&Path>, summary: &mut SetupSummary) {
+    if summary.failed() || !project::has_notebooks(workspace) {
+        return;
+    }
+    let Some(env) = env::project_env(workspace) else {
+        return;
+    };
+    if installed::has_usable_ipykernel(&installed::scan(&env.path), env.python) {
+        return;
+    }
+    pixi_manage::add_ipykernel(pixi, workspace, summary).await;
 }
 
 /// Step name for the post-install torch GPU self-test.
@@ -182,6 +242,11 @@ pub(crate) async fn ensure_ipykernel(
     mode: ResolvedMode,
     summary: &mut SetupSummary,
 ) {
+    if mode == ResolvedMode::Pixi {
+        let pixi = pixi::locate().await;
+        ensure_pixi_ipykernel(workspace, pixi.as_deref(), summary).await;
+        return;
+    }
     let venv = workspace.join(".venv");
     if summary.failed()
         || !venv.is_dir()
@@ -227,6 +292,8 @@ pub(crate) async fn ensure_ipykernel(
                 }
             }
         }
+        // Handled above; never reached.
+        ResolvedMode::Pixi => return,
         ResolvedMode::PurePip => {
             match outcome(pip::install_packages(&venv, &packages, None, workspace).await) {
                 Ok(_) => match outcome(pip::freeze_requirements(&venv, workspace).await) {
@@ -714,6 +781,7 @@ mod tests {
     use super::*;
     use crate::core::probe::{Probes, VenvInfo};
     use crate::core::Assessment;
+    use crate::settings::PackageManager;
 
     fn assessment(venv: Option<VenvInfo>) -> Assessment {
         Assessment {
@@ -726,6 +794,103 @@ mod tests {
             target_python: None,
             findings: Vec::new(),
         }
+    }
+
+    /// Every file and directory under `root`, relative and sorted.
+    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    out.push((rel, Vec::new()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The guard: in a pixi project with no pixi to run, setup, install,
+    /// rebuild and the notebook kernel all stop with the pixi message and
+    /// leave every file as it was. No `.venv`, no uv, no pip, even with the
+    /// user's package manager set to uv.
+    #[tokio::test]
+    async fn pixi_project_without_pixi_is_left_untouched() {
+        let root = std::env::temp_dir().join(format!("pypilot-pixi-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("pixi.toml"),
+            include_str!("../../tests/fixtures/pixi/pixi-0.81-init.pixi.toml"),
+        )
+        .unwrap();
+        std::fs::write(root.join("main.py"), "import requests\n").unwrap();
+        std::fs::write(root.join("analysis.ipynb"), "{}").unwrap();
+        std::fs::write(root.join("requirements.txt"), "requests\n").unwrap();
+        let before = tree(&root);
+
+        // Only this test asks for pixi, so pointing the override at a missing
+        // binary makes "pixi is not installed" deterministic here.
+        std::env::set_var(pixi::PIXI_OVERRIDE_ENV, root.join("no-such-pixi"));
+        let settings = Settings {
+            package_manager: PackageManager::Uv,
+            data_refresh_days: 0,
+            ..Settings::default()
+        };
+        let source = crate::pypi::FixtureSource::new();
+
+        let summary = run(&root, &settings, &source).await.unwrap();
+        assert_eq!(summary.resolved_mode, ResolvedMode::Pixi);
+        assert!(!summary.ok);
+        let failed: Vec<&Step> = summary.steps.iter().filter(|s| !s.ok).collect();
+        assert_eq!(failed.len(), 1, "{:?}", summary.steps);
+        assert_eq!(failed[0].name, pixi_manage::LOCATE_STEP);
+        assert_eq!(failed[0].detail, pixi_manage::MISSING_PIXI);
+        assert!(summary.steps.iter().all(|s| !s.name.contains("uv")
+            && !s.name.contains("pip")
+            && !s.name.contains("venv")));
+
+        // An explicit uv mode from the editor's prompt is overridden too.
+        let summary = run_with_mode(&root, &settings, &source, ResolvedMode::UvFull)
+            .await
+            .unwrap();
+        assert_eq!(summary.resolved_mode, ResolvedMode::Pixi);
+
+        let summary = crate::core::install::install_packages(&root, &settings, &["numpy".into()])
+            .await
+            .unwrap();
+        assert!(!summary.ok);
+        assert_eq!(
+            summary.steps.last().unwrap().detail,
+            pixi_manage::MISSING_PIXI
+        );
+
+        let summary = crate::core::install::recreate_with_python(
+            &root,
+            &settings,
+            PyVersion::py3(11),
+            &["numpy".into()],
+        )
+        .await
+        .unwrap();
+        assert!(!summary.ok);
+
+        let mut summary = run(&root, &settings, &source).await.unwrap();
+        summary.ok = true;
+        ensure_ipykernel(&root, &settings, ResolvedMode::Pixi, &mut summary).await;
+
+        for absent in [".venv", "uv.lock", "pyproject.toml", ".pixi"] {
+            assert!(!root.join(absent).exists(), "{absent} was created");
+        }
+        assert_eq!(tree(&root), before, "the project changed on disk");
+        std::env::remove_var(pixi::PIXI_OVERRIDE_ENV);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

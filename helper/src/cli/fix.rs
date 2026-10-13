@@ -40,6 +40,17 @@ async fn fix_cuda(workspace: &Path, settings: &Settings) -> crate::Result<()> {
         return Ok(());
     }
 
+    let mode = settings.resolve_mode(workspace).await;
+    if mode == ResolvedMode::Pixi {
+        // A `uv pip install` or a `[tool.uv]` index would fight pixi, which
+        // rebuilds the environment from its own manifest and lock.
+        println!(
+            "  {} pixi project: PyPilot does not re-pin torch/tensorflow here. Take a CUDA build from conda-forge (pytorch-gpu, with `cuda` under [system-requirements]), or add the matched index under [pypi-options], then run `pixi install`.",
+            "[INFO ]".cyan().bold()
+        );
+        return Ok(());
+    }
+
     let mut any_failed = false;
     for req in frameworks {
         let Some(solved) = solve_framework(&req.name, Some(req), settings).await else {
@@ -54,7 +65,6 @@ async fn fix_cuda(workspace: &Path, settings: &Settings) -> crate::Result<()> {
         };
         let spec = format!("{}=={version}", req.name);
 
-        let mode = settings.resolve_mode().await;
         let pyproject = workspace.join("pyproject.toml");
         if mode == ResolvedMode::UvFull && pyproject.is_file() {
             // A `uv pip install` here would be undone by the next `uv sync`,
@@ -108,6 +118,8 @@ async fn fix_cuda(workspace: &Path, settings: &Settings) -> crate::Result<()> {
                     println!("  {} failed {}", "✗".red().bold(), out.stderr.trim().red());
                 }
             }
+            // Returned above: pixi projects are never re-pinned here.
+            ResolvedMode::Pixi => {}
             ResolvedMode::PurePip => {
                 let venv = workspace.join(".venv");
                 if !venv.is_dir() {
@@ -199,8 +211,14 @@ async fn fix_python<S: MetadataSource>(
     );
 
     // Rebuild and restore the declared dependencies. There is no single new
-    // package here, so reuse the bootstrap rather than the add path.
-    let summary = crate::core::setup::run(workspace, settings, source).await?;
+    // package here, so reuse the bootstrap rather than the add path. A pixi
+    // project changes its manifest's python spec instead (`pixi add
+    // python=X.Y` + `pixi install`).
+    let summary = if settings.resolve_mode(workspace).await == ResolvedMode::Pixi {
+        install::recreate_with_python(workspace, settings, target, &[]).await?
+    } else {
+        crate::core::setup::run(workspace, settings, source).await?
+    };
     for step in &summary.steps {
         let mark = if step.ok {
             "✓".green().bold()

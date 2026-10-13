@@ -723,7 +723,10 @@ async fn scan_and_notify(client: &Client, source: &PyPiClient, root: &Path, expl
 async fn run_fix(client: &Client, source: &PyPiClient, root: &Path) -> bool {
     let settings = Settings::load(root);
 
-    let mode = if settings.package_manager == PackageManager::Auto
+    // A pixi project is set up by pixi, so there is no uv to offer.
+    let pixi_project = crate::core::pixi::detect(root).is_some();
+    let mode = if !pixi_project
+        && settings.package_manager == PackageManager::Auto
         && crate::core::uv::is_system_installed().await.is_none()
     {
         // Tier B: uv is NOT on PATH, prompt user to install
@@ -793,7 +796,7 @@ async fn run_fix(client: &Client, source: &PyPiClient, root: &Path) -> bool {
             ResolvedMode::PurePip
         }
     } else {
-        settings.resolve_mode().await
+        settings.resolve_mode(root).await
     };
 
     client

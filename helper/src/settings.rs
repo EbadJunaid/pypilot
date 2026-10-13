@@ -44,6 +44,14 @@ pub enum ResolvedMode {
     UvPipCompat,
     /// Pure pip ecosystem (python -m venv + pip install + pip freeze).
     PurePip,
+    /// A pixi project, managed with pixi alone (`pixi install`, `pixi add`).
+    ///
+    /// Chosen whenever the project has a pixi manifest, whatever
+    /// `package_manager` says: that setting picks how PyPilot builds an
+    /// environment it owns, and a pixi project's environment is pixi's. A
+    /// `.venv`, `uv.lock` or `[tool.uv]` beside it would be a second,
+    /// competing environment (see [`crate::core::pixi_manage`]).
+    Pixi,
 }
 
 /// F5 toast verbosity.
@@ -135,9 +143,9 @@ impl Settings {
         Ok(())
     }
 
-    /// Resolve the operational mode for this settings instance.
-    pub async fn resolve_mode(&self) -> ResolvedMode {
-        resolve_mode(self).await
+    /// Resolve the operational mode for the project at `workspace`.
+    pub async fn resolve_mode(&self, workspace: &Path) -> ResolvedMode {
+        resolve_mode(self, workspace).await
     }
 
     /// Persist the chosen package manager into `<workspace>/.zed/pypilot.toml`,
@@ -155,8 +163,12 @@ impl Settings {
     }
 }
 
-/// Resolve the operational mode from settings, checking system uv for Auto mode.
-pub async fn resolve_mode(settings: &Settings) -> ResolvedMode {
+/// Resolve the operational mode from settings, checking system uv for Auto
+/// mode. A pixi project is always [`ResolvedMode::Pixi`].
+pub async fn resolve_mode(settings: &Settings, workspace: &Path) -> ResolvedMode {
+    if crate::core::pixi::detect(workspace).is_some() {
+        return ResolvedMode::Pixi;
+    }
     match settings.package_manager {
         PackageManager::Uv => ResolvedMode::UvFull,
         PackageManager::UvPip => ResolvedMode::UvPipCompat,
@@ -241,7 +253,7 @@ mod tests {
             package_manager: PackageManager::Pip,
             ..Settings::default()
         };
-        assert_eq!(s.resolve_mode().await, ResolvedMode::PurePip);
+        assert_eq!(s.resolve_mode(Path::new(".")).await, ResolvedMode::PurePip);
     }
 
     #[tokio::test]
@@ -250,7 +262,7 @@ mod tests {
             package_manager: PackageManager::Uv,
             ..Settings::default()
         };
-        assert_eq!(s.resolve_mode().await, ResolvedMode::UvFull);
+        assert_eq!(s.resolve_mode(Path::new(".")).await, ResolvedMode::UvFull);
     }
 
     #[tokio::test]
@@ -259,7 +271,31 @@ mod tests {
             package_manager: PackageManager::UvPip,
             ..Settings::default()
         };
-        assert_eq!(s.resolve_mode().await, ResolvedMode::UvPipCompat);
+        assert_eq!(
+            s.resolve_mode(Path::new(".")).await,
+            ResolvedMode::UvPipCompat
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pixi_project_is_always_pixi_mode() {
+        let dir = std::env::temp_dir().join(format!("pypilot-mode-pixi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pixi.toml"), "[workspace]\nplatforms = []\n").unwrap();
+        for pm in [
+            PackageManager::Auto,
+            PackageManager::Uv,
+            PackageManager::UvPip,
+            PackageManager::Pip,
+        ] {
+            let s = Settings {
+                package_manager: pm,
+                ..Settings::default()
+            };
+            assert_eq!(s.resolve_mode(&dir).await, ResolvedMode::Pixi, "{pm:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

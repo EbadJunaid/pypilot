@@ -17,7 +17,11 @@ pub async fn run<S: MetadataSource>(
         "{} — {} ({})",
         "PyPilot setup".bold().cyan(),
         workspace.display(),
-        format!("{:?} mode", settings.package_manager).bold()
+        if crate::core::pixi::detect(workspace).is_some() {
+            "pixi project".bold()
+        } else {
+            format!("{:?} mode", settings.package_manager).bold()
+        }
     );
 
     let summary = setup::run(workspace, settings, source).await?;

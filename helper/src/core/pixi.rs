@@ -610,10 +610,24 @@ pub async fn pixi_version() -> Option<String> {
     find_pixi().await.map(|(_, version)| version)
 }
 
-/// Locate a working pixi: PATH first, then `$PIXI_HOME/bin` and
-/// `~/.pixi/bin`, where the official installer puts it (an editor started
-/// before the install may not have it on PATH yet).
+/// The pixi binary to run, if one works.
+pub async fn locate() -> Option<PathBuf> {
+    find_pixi().await.map(|(path, _)| path)
+}
+
+/// Names the pixi binary to use instead of searching for one (a portable
+/// pixi, say). When set, nothing else is tried.
+pub const PIXI_OVERRIDE_ENV: &str = "PYPILOT_PIXI";
+
+/// Locate a working pixi: [`PIXI_OVERRIDE_ENV`] when set, else PATH, then
+/// `$PIXI_HOME/bin` and `~/.pixi/bin`, where the official installer puts it
+/// (an editor started before the install may not have it on PATH yet).
 async fn find_pixi() -> Option<(PathBuf, String)> {
+    if let Some(path) = std::env::var_os(PIXI_OVERRIDE_ENV).filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        let v = command::probe_version(&path, &["--version"]).await?;
+        return Some((path, clean_version(&v)));
+    }
     if let Some(v) = command::probe_version("pixi", &["--version"]).await {
         return Some((PathBuf::from("pixi"), clean_version(&v)));
     }
