@@ -60,6 +60,9 @@ pub async fn run<S: MetadataSource>(
         ),
         None => println!("  {:<16}: {}", "virtualenv", "none".yellow()),
     }
+    if let Some(pixi) = crate::core::pixi::detect(workspace) {
+        println!("  {:<16}: {}", "pixi project", pixi.manifest.display());
+    }
     if a.probes.interpreters.is_empty() {
         println!("  {:<16}: {}", "interpreters", "none found".yellow());
     } else {
