@@ -31,6 +31,22 @@ impl EnvKind {
     pub fn is_pixi(&self) -> bool {
         matches!(self, EnvKind::Pixi { .. })
     }
+
+    /// How user-facing text names this kind of environment (see [`env_name`]).
+    pub fn name(&self) -> &'static str {
+        env_name(self.is_pixi())
+    }
+}
+
+/// How user-facing text names a project's environment: `.venv`, or `the
+/// pixi environment` for a pixi prefix, which has no directory the user
+/// would recognise by name.
+pub fn env_name(pixi: bool) -> &'static str {
+    if pixi {
+        "the pixi environment"
+    } else {
+        ".venv"
+    }
 }
 
 /// A project's environment as found on disk.
@@ -45,6 +61,15 @@ pub struct ProjectEnv {
     /// The interpreter the environment needs that is missing from disk, when
     /// it can no longer run.
     pub broken: Option<PathBuf>,
+}
+
+/// The sentence for a project with no environment yet.
+pub fn no_env_sentence(pixi: bool) -> &'static str {
+    if pixi {
+        "This pixi project's environment is not installed yet; `pixi install` creates it."
+    } else {
+        "This project has no virtual environment yet."
+    }
 }
 
 /// The venv directory names looked for, in order.

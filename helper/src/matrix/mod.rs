@@ -160,8 +160,7 @@ pub async fn check(
             // cu121 wheel carried over from before an RTX 50-series upgrade.
             if Framework::from_package_name(&req.name) == Some(Framework::Torch) {
                 if let Some(env) = crate::core::env::project_env(workspace) {
-                    findings
-                        .extend(solve::check_installed_torch(&env.path, &solved, settings).await);
+                    findings.extend(solve::check_installed_torch(&env, &solved, settings).await);
                 }
             }
             findings.extend(solved.finding);

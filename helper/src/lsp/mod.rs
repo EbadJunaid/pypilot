@@ -1101,7 +1101,10 @@ async fn package_check_markdown(source: &PyPiClient, a: &Assessment, package: &s
                 .max()
                 .map(|t| format!(" Python {t} would suit it."))
                 .unwrap_or_default();
-            format!("This project has no virtual environment yet.{suggestion}")
+            format!(
+                "{}{suggestion}",
+                crate::core::env::no_env_sentence(a.project.is_pixi())
+            )
         }
     };
     s.push_str(&format!("\n{verdict}\n"));

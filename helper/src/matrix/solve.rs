@@ -468,11 +468,13 @@ fn arch_mismatch(
 ///
 /// `fix` is the sentence telling the user what to run instead; the caller
 /// builds it because it depends on the project's pins and the driver.
+/// `pixi` says the environment is a pixi prefix rather than a `.venv`.
 pub fn installed_torch_finding(
     installed: &str,
     gpu_name: &str,
     req: &ArchRequirement,
     fix: &str,
+    pixi: bool,
 ) -> Option<Finding> {
     let local = installed.split_once('+').map(|(_, l)| l);
     // `+cpu` / `+rocm*` builds never launch CUDA kernels: not this check's
@@ -520,7 +522,8 @@ pub fn installed_torch_finding(
             req.cap.sm()
         ),
         detail: format!(
-            "The .venv has torch {installed}{built}. {} needs a build against CUDA {}{torch_floor}. {consequence} {fix}",
+            "{} has torch {installed}{built}. {} needs a build against CUDA {}{torch_floor}. {consequence} {fix}",
+            env_subject(pixi),
             req.describe(gpu_name),
             cuda_range(req)
         ),
@@ -532,11 +535,12 @@ pub fn installed_torch_finding(
 /// project's own torch solve) for the reinstall command when it produced a
 /// usable CUDA build, and the newest compatible release otherwise.
 pub async fn check_installed_torch(
-    venv: &std::path::Path,
+    env: &crate::core::env::ProjectEnv,
     solved: &FrameworkSolve,
     settings: &Settings,
 ) -> Option<Finding> {
-    let installed = crate::core::installed::scan(venv).version_of("torch")?;
+    let installed = crate::core::installed::scan(&env.path).version_of("torch")?;
+    let pixi = env.kind.is_pixi();
     let Accelerator::Nvidia {
         name,
         driver_version,
@@ -571,12 +575,23 @@ pub async fn check_installed_torch(
         os,
     )?;
 
-    let fix = reinstall_sentence(solved, &arch);
-    installed_torch_finding(&installed, &name, &arch.req, &fix)
+    let fix = reinstall_sentence(solved, &arch, pixi);
+    installed_torch_finding(&installed, &name, &arch.req, &fix, pixi)
 }
 
-/// The "what to run" sentence for a wrong installed build.
-fn reinstall_sentence(solved: &FrameworkSolve, arch: &ArchContext) -> String {
+/// The environment as the subject of a sentence.
+fn env_subject(pixi: bool) -> &'static str {
+    if pixi {
+        "The pixi environment"
+    } else {
+        "The .venv"
+    }
+}
+
+/// The "what to run" sentence for a wrong installed build. In a pixi
+/// environment a pip reinstall would be undone by the next `pixi install`,
+/// so the build is pinned in the manifest instead.
+fn reinstall_sentence(solved: &FrameworkSolve, arch: &ArchContext, pixi: bool) -> String {
     let solved_ok = solved
         .finding
         .as_ref()
@@ -593,6 +608,9 @@ fn reinstall_sentence(solved: &FrameworkSolve, arch: &ArchContext) -> String {
             .map(|(v, b)| (v.clone(), b.index_url.clone()))
     });
     match pick {
+        Some((v, url)) if pixi => format!(
+            "Pin the right build in the pixi manifest's PyPI dependencies, `torch = {{ version = \"=={v}\", index = \"{url}\" }}`, then run `pixi install`; a pip reinstall would be undone by the next `pixi install`."
+        ),
         Some((v, url)) => {
             format!("Reinstall the right build: pip install --force-reinstall torch=={v} --index-url {url}")
         }
@@ -602,10 +620,12 @@ fn reinstall_sentence(solved: &FrameworkSolve, arch: &ArchContext) -> String {
                 .as_deref()
                 .map(|d| format!(" to {d} or newer"))
                 .unwrap_or_default();
-            format!(
-                "Update the NVIDIA driver{driver}, then reinstall torch from a CUDA {} build.",
-                cuda_range(&arch.req)
-            )
+            let cuda = cuda_range(&arch.req);
+            if pixi {
+                format!("Update the NVIDIA driver{driver}, then point torch at a CUDA {cuda} build in the pixi manifest and run `pixi install`.")
+            } else {
+                format!("Update the NVIDIA driver{driver}, then reinstall torch from a CUDA {cuda} build.")
+            }
         }
     }
 }
@@ -1207,8 +1227,8 @@ mod tests {
     #[test]
     fn installed_cu121_torch_on_blackwell_is_an_error_with_a_reinstall() {
         let arch = arch_for("12.0", &support(12, 9));
-        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch);
-        let f = installed_torch_finding("2.5.1+cu121", "RTX 5090", &arch.req, &fix).unwrap();
+        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch, false);
+        let f = installed_torch_finding("2.5.1+cu121", "RTX 5090", &arch.req, &fix, false).unwrap();
         assert_eq!(f.severity, Severity::Error);
         assert!(f.detail.contains("built against CUDA 12.1"));
         assert!(
@@ -1220,42 +1240,79 @@ mod tests {
     }
 
     #[test]
+    fn installed_torch_in_a_pixi_environment_is_named_and_fixed_through_pixi() {
+        let arch = arch_for("12.0", &support(12, 9));
+        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch, true);
+        let f = installed_torch_finding("2.5.1+cu121", "RTX 5090", &arch.req, &fix, true).unwrap();
+        assert!(
+            f.detail
+                .starts_with("The pixi environment has torch 2.5.1+cu121"),
+            "{}",
+            f.detail
+        );
+        assert!(!f.detail.contains(".venv"), "{}", f.detail);
+        assert!(!f.detail.contains("pip install"), "{}", f.detail);
+        assert!(f
+            .detail
+            .contains("index = \"https://download.pytorch.org/whl/cu128\""));
+        assert!(f.detail.contains("`pixi install`"));
+
+        let venv =
+            installed_torch_finding("2.5.1+cu121", "RTX 5090", &arch.req, "", false).unwrap();
+        assert!(venv.detail.starts_with("The .venv has torch 2.5.1+cu121"));
+
+        let mut arch = arch;
+        arch.alternative = None;
+        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch, true);
+        assert!(
+            fix.contains("in the pixi manifest and run `pixi install`"),
+            "{fix}"
+        );
+    }
+
+    #[test]
     fn installed_cu126_build_of_a_new_enough_torch_is_still_wrong() {
         // torch 2.7.1 is new enough, but its cu126 build has no sm_120.
-        let f = installed_torch_finding("2.7.1+cu126", "RTX 5080", &requirement("12.0"), "fix");
+        let f = installed_torch_finding(
+            "2.7.1+cu126",
+            "RTX 5080",
+            &requirement("12.0"),
+            "fix",
+            false,
+        );
         assert_eq!(f.unwrap().severity, Severity::Error);
     }
 
     #[test]
     fn installed_correct_build_is_silent() {
         let req = requirement("12.0");
-        assert!(installed_torch_finding("2.7.1+cu128", "RTX 5090", &req, "").is_none());
-        assert!(installed_torch_finding("2.9.0+cu130", "RTX 5090", &req, "").is_none());
+        assert!(installed_torch_finding("2.7.1+cu128", "RTX 5090", &req, "", false).is_none());
+        assert!(installed_torch_finding("2.9.0+cu130", "RTX 5090", &req, "", false).is_none());
         // Ada is happy with anything PyPilot curates.
         let ada = requirement("8.9");
-        assert!(installed_torch_finding("2.4.0+cu121", "RTX 4090", &ada, "").is_none());
+        assert!(installed_torch_finding("2.4.0+cu121", "RTX 4090", &ada, "", false).is_none());
     }
 
     #[test]
     fn installed_cpu_or_rocm_build_is_not_this_checks_business() {
         let req = requirement("12.0");
-        assert!(installed_torch_finding("2.5.1+cpu", "RTX 5090", &req, "").is_none());
-        assert!(installed_torch_finding("2.5.1+rocm6.2", "RTX 5090", &req, "").is_none());
+        assert!(installed_torch_finding("2.5.1+cpu", "RTX 5090", &req, "", false).is_none());
+        assert!(installed_torch_finding("2.5.1+rocm6.2", "RTX 5090", &req, "", false).is_none());
     }
 
     #[test]
     fn installed_plain_pypi_torch_is_judged_on_version_alone() {
         let req = requirement("12.0");
-        assert!(installed_torch_finding("2.5.1", "RTX 5090", &req, "").is_some());
-        assert!(installed_torch_finding("2.8.0", "RTX 5090", &req, "").is_none());
+        assert!(installed_torch_finding("2.5.1", "RTX 5090", &req, "", false).is_some());
+        assert!(installed_torch_finding("2.8.0", "RTX 5090", &req, "", false).is_none());
     }
 
     #[test]
     fn installed_cuda_13_torch_on_pascal_is_a_warning() {
         let pascal = requirement("6.1");
-        let f = installed_torch_finding("2.9.0+cu130", "GTX 1080", &pascal, "fix").unwrap();
+        let f = installed_torch_finding("2.9.0+cu130", "GTX 1080", &pascal, "fix", false).unwrap();
         assert_eq!(f.severity, Severity::Warning);
-        assert!(installed_torch_finding("2.9.0+cu126", "GTX 1080", &pascal, "").is_none());
+        assert!(installed_torch_finding("2.9.0+cu126", "GTX 1080", &pascal, "", false).is_none());
     }
 
     #[test]
@@ -1266,7 +1323,7 @@ mod tests {
             index_url: Some("https://download.pytorch.org/whl/cu128".into()),
             ..Default::default()
         };
-        let fix = reinstall_sentence(&solved, &arch);
+        let fix = reinstall_sentence(&solved, &arch, false);
         assert!(fix.contains("torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128"));
     }
 
@@ -1274,7 +1331,7 @@ mod tests {
     fn reinstall_without_any_usable_build_says_to_update_the_driver() {
         let mut arch = arch_for("12.0", &support(12, 9));
         arch.alternative = None;
-        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch);
+        let fix = reinstall_sentence(&FrameworkSolve::default(), &arch, false);
         assert!(
             fix.contains("Update the NVIDIA driver to 570.65 or newer"),
             "{fix}"

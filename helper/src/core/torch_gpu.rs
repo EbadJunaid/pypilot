@@ -25,9 +25,13 @@ use crate::core::{Finding, FixKind, Severity};
 use crate::matrix;
 use crate::settings::Settings;
 
-/// Title of the static finding, shared with tests.
-pub const CPU_TORCH_TITLE: &str =
-    "torch in .venv is a CPU build but this machine has an NVIDIA GPU";
+/// Title of the static finding, for a pixi environment or a `.venv`.
+pub fn cpu_torch_title(pixi: bool) -> String {
+    format!(
+        "torch in {} is a CPU build but this machine has an NVIDIA GPU",
+        crate::core::env::env_name(pixi)
+    )
+}
 
 /// How long the self-test may take. Importing torch and initializing CUDA is
 /// slow on a cold cache, but a minute means something is stuck.
@@ -110,15 +114,28 @@ pub fn classify(version: &str, version_py: Option<&str>, os: Os, arch: Arch) -> 
 
 /// The warning for a CPU torch on an NVIDIA machine, or `None` when the
 /// build is fine (or cannot be judged). `reinstall` is the command that pulls
-/// the build matched to the driver, when the matrix knows one.
+/// the build matched to the driver, when the matrix knows one; `pixi` says
+/// the environment is a pixi prefix, where a pip reinstall is the wrong
+/// advice: pixi owns the environment and undoes it on the next install.
 pub fn cpu_torch_finding(
     build: &TorchBuild,
     version: &str,
     gpu_name: &str,
     reinstall: Option<&str>,
+    pixi: bool,
 ) -> Option<Finding> {
     if *build != TorchBuild::Cpu {
         return None;
+    }
+    if pixi {
+        return Some(Finding {
+            severity: Severity::Warning,
+            title: cpu_torch_title(true),
+            detail: format!(
+                "{gpu_name} is present, but torch {version} in the pixi environment is a CPU-only build, so torch.cuda.is_available() returns False and everything runs on the CPU. Ask pixi for a CUDA build instead of reinstalling with pip, which the next `pixi install` would undo: take torch from conda-forge (`pixi add pytorch-gpu`, with `cuda` set under `[system-requirements]`), or point `[pypi-options]` at the PyTorch CUDA index matched to your driver."
+            ),
+            fix: FixKind::Manual,
+        });
     }
     let fix = match reinstall {
         Some(cmd) => format!("Reinstall it from the index matched to your driver: {cmd}"),
@@ -126,7 +143,7 @@ pub fn cpu_torch_finding(
     };
     Some(Finding {
         severity: Severity::Warning,
-        title: CPU_TORCH_TITLE.to_string(),
+        title: cpu_torch_title(false),
         detail: format!(
             "{gpu_name} is present, but torch {version} in .venv is a CPU-only build, so torch.cuda.is_available() returns False and everything runs on the CPU. This happens when torch came from the default index (CPU-only on Windows) or a later install replaced the CUDA build. {fix} In a uv project, also pin the index in pyproject.toml so the next sync keeps it."
         ),
@@ -164,14 +181,9 @@ pub async fn static_check(venv: &Path, settings: &Settings) -> Option<Finding> {
     let Accelerator::Nvidia { name, .. } = gpu::detect().await else {
         return None;
     };
-    // In a pixi prefix (a conda environment) a pip reinstall is the wrong
-    // advice: pixi owns the environment and undoes it on the next install.
+    // A pixi prefix is a conda environment: no pip reinstall to offer.
     if venv.join("conda-meta").is_dir() {
-        let mut finding = cpu_torch_finding(&build, &version, &name, None)?;
-        finding.detail = format!(
-            "{name} is present, but torch {version} in the pixi environment is a CPU-only build, so torch.cuda.is_available() returns False and everything runs on the CPU. Ask pixi for a CUDA build instead of reinstalling with pip, which the next `pixi install` would undo: take torch from conda-forge (`pixi add pytorch-gpu`, with `cuda` set under `[system-requirements]`), or point `[pypi-options]` at the PyTorch CUDA index matched to your driver."
-        );
-        return Some(finding);
+        return cpu_torch_finding(&build, &version, &name, None, true);
     }
     let reinstall = match matched_index(&version, settings).await {
         // The driver is too old for every CUDA build, so CPU is right; F2
@@ -183,7 +195,7 @@ pub async fn static_check(venv: &Path, settings: &Settings) -> Option<Finding> {
         )),
         None => None,
     };
-    cpu_torch_finding(&build, &version, &name, reinstall.as_deref())
+    cpu_torch_finding(&build, &version, &name, reinstall.as_deref(), false)
 }
 
 /// Run in the venv's Python. Prints one JSON line; never raises, so a broken
@@ -391,22 +403,35 @@ mod tests {
     fn only_cpu_builds_produce_the_warning() {
         let gpu = "NVIDIA GeForce RTX 3080";
         let cmd = "pip install --force-reinstall torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124";
-        let f = cpu_torch_finding(&TorchBuild::Cpu, "2.5.1+cpu", gpu, Some(cmd)).unwrap();
+        let f = cpu_torch_finding(&TorchBuild::Cpu, "2.5.1+cpu", gpu, Some(cmd), false).unwrap();
         assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.title, CPU_TORCH_TITLE);
+        assert_eq!(
+            f.title,
+            "torch in .venv is a CPU build but this machine has an NVIDIA GPU"
+        );
         assert!(f.detail.contains(gpu));
         assert!(f.detail.contains("2.5.1+cpu"));
         assert!(f.detail.contains(cmd));
 
-        let f = cpu_torch_finding(&TorchBuild::Cpu, "2.5.1", gpu, None).unwrap();
+        let f = cpu_torch_finding(&TorchBuild::Cpu, "2.5.1", gpu, None, false).unwrap();
         assert!(f.detail.contains("pytorch.org"));
+
+        // A pixi environment is named as such, and never told to use pip.
+        let f = cpu_torch_finding(&TorchBuild::Cpu, "2.5.1", gpu, Some(cmd), true).unwrap();
+        assert_eq!(
+            f.title,
+            "torch in the pixi environment is a CPU build but this machine has an NVIDIA GPU"
+        );
+        assert!(!f.title.contains(".venv") && !f.detail.contains(".venv"));
+        assert!(!f.detail.contains("pip install"), "{}", f.detail);
+        assert!(f.detail.contains("pixi"));
 
         for build in [
             TorchBuild::Cuda(None),
             TorchBuild::Other,
             TorchBuild::Unknown,
         ] {
-            assert!(cpu_torch_finding(&build, "2.5.1", gpu, Some(cmd)).is_none());
+            assert!(cpu_torch_finding(&build, "2.5.1", gpu, Some(cmd), false).is_none());
         }
     }
 

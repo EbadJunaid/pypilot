@@ -118,9 +118,11 @@ pub async fn run<S: MetadataSource>(
                 .max()
                 .map(|t| format!(" Python {t} would suit it."))
                 .unwrap_or_default();
+            let pixi = crate::core::pixi::detect(workspace).is_some();
             println!(
-                "  {} This project has no virtual environment yet.{}",
+                "  {} {}{}",
                 "[INFO ]".cyan().bold(),
+                crate::core::env::no_env_sentence(pixi),
                 suggestion.cyan()
             );
         }
