@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::core::installed::{self, Installed};
+use crate::core::project::normalize_name;
 use crate::core::{pip, pixi, probe};
 use crate::pypi::pyversion::PyVersion;
 
@@ -113,6 +115,46 @@ fn from_pixi(project: &pixi::PixiProject, env: pixi::PixiEnv) -> ProjectEnv {
     }
 }
 
+/// What the project can import, for the import diagnostics: the
+/// distributions in its environment, plus, in a pixi project, every conda
+/// package pixi installed or the manifest declares. A conda package is not
+/// always a Python distribution with a `.dist-info`, and its name is not a
+/// PyPI name, so without this a conda dependency would be reported as missing
+/// or as unknown to PyPI.
+pub fn importable(workspace: &Path, env: Option<&ProjectEnv>) -> Installed {
+    let mut installed = env.map(|e| installed::scan(&e.path)).unwrap_or_default();
+    let Some(project) = pixi::detect(workspace) else {
+        return installed;
+    };
+    let mut names: Vec<String> = project.conda_deps.iter().map(|d| d.name.clone()).collect();
+    if let Some(env) = env.filter(|e| e.kind.is_pixi()) {
+        names.extend(conda_meta_names(&env.path));
+    }
+    installed
+        .packages
+        .extend(names.iter().map(|n| normalize_name(n)));
+    installed
+}
+
+/// Package names of the conda records in a prefix's `conda-meta/`
+/// (`numpy-2.1.0-py312_0.json` -> `numpy`).
+fn conda_meta_names(prefix: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(prefix.join("conda-meta")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| conda_record_name(&e.file_name().to_string_lossy()))
+        .collect()
+}
+
+fn conda_record_name(file: &str) -> Option<String> {
+    let stem = file.strip_suffix(".json")?;
+    let mut parts = stem.rsplitn(3, '-');
+    let (_build, _version, name) = (parts.next()?, parts.next()?, parts.next()?);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The interpreter inside an environment root of the given kind.
 pub fn python_in(kind: &EnvKind, path: &Path) -> PathBuf {
     match kind {
@@ -211,6 +253,29 @@ pub(crate) mod tests {
         std::fs::create_dir_all(root.join(".venv")).unwrap();
         std::fs::write(root.join(".venv").join("pyvenv.cfg"), "version = 3.10.1\n").unwrap();
         assert_eq!(project_env(&root), None);
+    }
+
+    #[test]
+    fn conda_packages_count_as_importable_in_pixi_projects() {
+        let (root, prefix) = pixi_fixture("importable", true);
+        let meta = prefix.join("conda-meta");
+        std::fs::write(meta.join("py-opencv-4.10.0-py312h1_0.json"), "{}").unwrap();
+        std::fs::write(meta.join("pixi"), "{}").unwrap();
+        std::fs::create_dir_all(installed_sp(&prefix).join("requests-2.34.2.dist-info")).unwrap();
+
+        let env = project_env(&root).unwrap();
+        let installed = importable(&root, Some(&env));
+        assert!(installed.contains("requests"));
+        assert!(installed.contains("py-opencv"));
+        assert!(installed.contains("python"));
+        // Declared in pixi.toml, even before pixi installed anything.
+        assert!(importable(&root, None).contains("numpy"));
+
+        // Outside pixi nothing is added.
+        let plain = scratch("importable-plain");
+        assert_eq!(importable(&plain, None).count(), 0);
+        assert_eq!(conda_record_name("history"), None);
+        assert_eq!(conda_record_name("pixi_env_prefix"), None);
     }
 
     #[test]

@@ -32,8 +32,8 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::core::platform::Platform;
 use crate::core::{
-    guardian, imports, install, installed, probe, project, pyright, rescan, setup, solver,
-    Assessment, FixKind, Severity,
+    env, guardian, imports, install, project, pyright, rescan, setup, solver, Assessment, FixKind,
+    Severity,
 };
 use crate::pypi::pyversion::PyVersion;
 use crate::pypi::{MetadataSource, PyPiClient};
@@ -59,7 +59,7 @@ const BTN_NO_THANKS: &str = "No thanks";
 const BTN_MODE_UV_PROJECT: &str = "uv project (pyproject.toml + lockfile)";
 const BTN_MODE_PIP_COMPAT: &str = "pip-compatible (requirements.txt, faster via uv)";
 
-const BTN_PIN_PYRIGHT: &str = "Point pyright at .venv";
+const BTN_PIN_PYRIGHT: &str = "Point pyright at the environment";
 const BTN_NOT_NOW: &str = "Not now";
 
 /// Whether the client is Zed. Only Zed's own Python servers are pointed at
@@ -360,15 +360,18 @@ async fn run_guardian(shared: Arc<Shared>, uri: Url) {
 
     // Everything here is local except the PyPI lookups, which are cached and
     // only happen for imports that are neither stdlib, local, nor installed.
-    let venv = root.join(".venv");
-    // A venv whose Python is gone can't import anything, so per-import
-    // verdicts against it would be wrong either way. The workspace scan
-    // reports it once, with the rebuild fix; until then, stay quiet here.
-    let findings = if probe::broken_venv(&venv).is_some() {
+    // The project's environment: its `.venv`, or its pixi prefix.
+    let env = env::project_env(&root);
+    // An environment whose Python is gone can't import anything, so
+    // per-import verdicts against it would be wrong either way. The
+    // workspace scan reports it once, with the rebuild fix; until then, stay
+    // quiet here.
+    let findings = if env.as_ref().is_some_and(|e| e.broken.is_some()) {
         Vec::new()
     } else {
-        let installed = installed::scan(&venv);
-        let venv_python = venv_python(&venv);
+        let installed = env::importable(&root, env.as_ref());
+        let venv_python = env.as_ref().and_then(|e| e.python);
+        let venv = env.map(|e| e.path).unwrap_or_else(|| root.join(".venv"));
 
         let mut findings = guardian::analyze_buffer_in(
             &text,
@@ -427,12 +430,6 @@ async fn refresh_all_buffers(shared: Arc<Shared>) {
     for uri in uris {
         run_guardian(shared.clone(), uri).await;
     }
-}
-
-/// Read the venv's Python version from `pyvenv.cfg`.
-fn venv_python(venv: &Path) -> Option<PyVersion> {
-    let text = std::fs::read_to_string(venv.join("pyvenv.cfg")).ok()?;
-    crate::core::probe::parse_pyvenv_version(&text)
 }
 
 /// Validate the requested names, telling the user which one was refused.
@@ -539,7 +536,8 @@ async fn run_recreate(shared: Arc<Shared>, root: &Path, python: &str, packages: 
     ok
 }
 
-/// After PyPilot has built `.venv`, offer to point pyright and basedpyright at
+/// After PyPilot has built the environment (`.venv`, or a pixi project's
+/// `.pixi/envs/default`), offer to point pyright and basedpyright at
 /// it (see [`pyright`]). Zed only, only when pyright is not configured yet, and
 /// never without the user's click. Spawned because the toast may stay
 /// unanswered, and the command that built the environment should finish now.
@@ -547,9 +545,10 @@ fn spawn_pyright_pin_offer(client: &Client, root: &Path) {
     if !CLIENT_IS_ZED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let Some(target) = pyright::pin_target(root) else {
+    let (Some(target), Some(env)) = (pyright::pin_target(root), pyright::pin_env(root)) else {
         return;
     };
+    let env = env.display();
     let client = client.clone();
     let root = root.to_path_buf();
     tokio::spawn(async move {
@@ -563,7 +562,7 @@ fn spawn_pyright_pin_offer(client: &Client, root: &Path) {
                 format!(
                     "PyPilot: if Zed's Python language server still reports installed packages \
                      as unresolved, it is using another environment. Pin pyright/basedpyright \
-                     to .venv in {file}? This overrides Zed's toolchain selection for them."
+                     to {env} in {file}? This overrides Zed's toolchain selection for them."
                 ),
                 Some(vec![action(BTN_PIN_PYRIGHT), action(BTN_NOT_NOW)]),
             )
@@ -579,7 +578,7 @@ fn spawn_pyright_pin_offer(client: &Client, root: &Path) {
                     .show_message(
                         MessageType::INFO,
                         format!(
-                            "PyPilot: wrote the .venv pin to {}. Restart the Python language \
+                            "PyPilot: wrote the {env} pin to {}. Restart the Python language \
                              server if it does not pick it up.",
                             path.display()
                         ),

@@ -1,4 +1,5 @@
-//! Pointing pyright and basedpyright at the project's `.venv`.
+//! Pointing pyright and basedpyright at the project's `.venv` (or, in a pixi
+//! project, at its `.pixi/envs/default` prefix).
 //!
 //! Zed hands its Python language servers the interpreter of whichever toolchain
 //! it selected, and in nested or multi-project worktrees that is sometimes not
@@ -26,12 +27,58 @@ pub enum PinTarget {
 const PYPROJECT: &str = "pyproject.toml";
 const PYRIGHTCONFIG: &str = "pyrightconfig.json";
 
-/// Where the venv pin can be written, or `None` when it should not be offered:
-/// no `.venv` to point at, or pyright is already configured (a
-/// `pyrightconfig.json`, or a `[tool.pyright]`/`[tool.basedpyright]` table),
-/// or `pyproject.toml` is not plain TOML we can safely extend.
+/// The environment a pin names, as pyright's `venvPath` (the directory that
+/// holds environments, relative to the root) and `venv` (the one to use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinEnv {
+    pub venv_path: &'static str,
+    pub venv: &'static str,
+}
+
+const VENV_PIN: PinEnv = PinEnv {
+    venv_path: ".",
+    venv: ".venv",
+};
+
+/// pyright finds an interpreter in a conda prefix as well as in a venv, so
+/// pixi's default environment is pinned the same way.
+const PIXI_PIN: PinEnv = PinEnv {
+    venv_path: ".pixi/envs",
+    venv: "default",
+};
+
+impl PinEnv {
+    /// The environment directory, relative to the project root.
+    pub fn display(&self) -> String {
+        if self.venv_path == "." {
+            self.venv.to_string()
+        } else {
+            format!("{}/{}", self.venv_path, self.venv)
+        }
+    }
+}
+
+/// The environment PyPilot would pin pyright to, when it exists: pixi's
+/// default environment in a pixi project, `.venv` otherwise.
+pub fn pin_env(root: &Path) -> Option<PinEnv> {
+    let env = if crate::core::pixi::detect(root).is_some() {
+        PIXI_PIN
+    } else {
+        VENV_PIN
+    };
+    root.join(env.venv_path)
+        .join(env.venv)
+        .is_dir()
+        .then_some(env)
+}
+
+/// Where the environment pin can be written, or `None` when it should not be
+/// offered: no environment to point at (see [`pin_env`]), or pyright is
+/// already configured (a `pyrightconfig.json`, or a
+/// `[tool.pyright]`/`[tool.basedpyright]` table), or `pyproject.toml` is not
+/// plain TOML we can safely extend.
 pub fn pin_target(root: &Path) -> Option<PinTarget> {
-    if !root.join(".venv").is_dir() || root.join(PYRIGHTCONFIG).exists() {
+    if pin_env(root).is_none() || root.join(PYRIGHTCONFIG).exists() {
         return None;
     }
     let pyproject = root.join(PYPROJECT);
@@ -56,11 +103,13 @@ fn configures_pyright(table: &toml::Table) -> bool {
 /// Write the pin, re-checking first so nothing existing is ever overwritten.
 /// Returns the file that was written.
 pub fn write_pin(root: &Path) -> crate::Result<PathBuf> {
-    match pin_target(root) {
+    let target = pin_target(root);
+    let env = pin_env(root).unwrap_or(VENV_PIN);
+    match target {
         Some(PinTarget::Pyproject) => {
             let path = root.join(PYPROJECT);
             let text = std::fs::read_to_string(&path)?;
-            let updated = with_pyright_table(&text)
+            let updated = with_pyright_table(&text, env)
                 .ok_or_else(|| anyhow::anyhow!("pyproject.toml could not be extended safely"))?;
             std::fs::write(&path, updated)?;
             Ok(path)
@@ -73,7 +122,11 @@ pub fn write_pin(root: &Path) -> crate::Result<PathBuf> {
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
-            file.write_all(b"{\n  \"venvPath\": \".\",\n  \"venv\": \".venv\"\n}\n")?;
+            let json = format!(
+                "{{\n  \"venvPath\": \"{}\",\n  \"venv\": \"{}\"\n}}\n",
+                env.venv_path, env.venv
+            );
+            file.write_all(json.as_bytes())?;
             Ok(path)
         }
         None => anyhow::bail!("pyright is already configured for this project"),
@@ -84,7 +137,7 @@ pub fn write_pin(root: &Path) -> crate::Result<PathBuf> {
 /// ending. `None` unless the result parses and carries exactly the pin, which
 /// rules out layouts where appending a table would be invalid (an inline
 /// `tool = { ... }`, say).
-fn with_pyright_table(text: &str) -> Option<String> {
+fn with_pyright_table(text: &str, env: PinEnv) -> Option<String> {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = text.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
@@ -94,19 +147,22 @@ fn with_pyright_table(text: &str) -> Option<String> {
         out.push_str(eol);
     }
     for line in [
-        "[tool.pyright]",
-        "# Written by PyPilot so pyright/basedpyright use this project's .venv.",
-        "venvPath = \".\"",
-        "venv = \".venv\"",
+        "[tool.pyright]".to_string(),
+        format!(
+            "# Written by PyPilot so pyright/basedpyright use this project's {}.",
+            env.display()
+        ),
+        format!("venvPath = \"{}\"", env.venv_path),
+        format!("venv = \"{}\"", env.venv),
     ] {
-        out.push_str(line);
+        out.push_str(&line);
         out.push_str(eol);
     }
 
     let table: toml::Table = out.parse().ok()?;
     let pyright = table.get("tool")?.get("pyright")?;
-    (pyright.get("venvPath")?.as_str() == Some(".")
-        && pyright.get("venv")?.as_str() == Some(".venv"))
+    (pyright.get("venvPath")?.as_str() == Some(env.venv_path)
+        && pyright.get("venv")?.as_str() == Some(env.venv))
     .then_some(out)
 }
 
@@ -201,11 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn a_pixi_project_is_pinned_to_its_default_environment() {
+        let dir = std::env::temp_dir().join("pypilot-pyright-pixi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pixi.toml"), "[workspace]\nplatforms = []\n").unwrap();
+        // A `.venv` next to pixi.toml is not the project's environment.
+        std::fs::create_dir_all(dir.join(".venv")).unwrap();
+        assert_eq!(pin_env(&dir), None);
+        assert_eq!(pin_target(&dir), None);
+
+        std::fs::create_dir_all(dir.join(".pixi/envs/default")).unwrap();
+        assert_eq!(pin_env(&dir).unwrap().display(), ".pixi/envs/default");
+        assert_eq!(pin_target(&dir), Some(PinTarget::PyrightConfig));
+        let path = write_pin(&dir).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["venvPath"], ".pixi/envs");
+        assert_eq!(json["venv"], "default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_appended_table_follows_the_file_line_endings() {
-        let crlf = with_pyright_table("[project]\r\nname = \"x\"").unwrap();
+        let crlf = with_pyright_table("[project]\r\nname = \"x\"", VENV_PIN).unwrap();
         assert!(crlf.ends_with("venv = \".venv\"\r\n"));
         assert!(!crlf.replace("\r\n", "").contains('\n'));
         // An inline `tool` table cannot take a `[tool.pyright]` header.
-        assert_eq!(with_pyright_table("tool = { black = {} }\n"), None);
+        assert_eq!(
+            with_pyright_table("tool = { black = {} }\n", VENV_PIN),
+            None
+        );
     }
 }

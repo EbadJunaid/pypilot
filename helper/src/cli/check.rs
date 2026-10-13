@@ -8,7 +8,7 @@ use std::path::Path;
 use colored::Colorize;
 
 use crate::core::platform::Platform;
-use crate::core::{installed, probe};
+use crate::core::probe;
 use crate::pypi::MetadataSource;
 use crate::settings::Settings;
 
@@ -54,8 +54,8 @@ pub async fn run<S: MetadataSource>(
         );
     }
 
-    let venv = workspace.join(".venv");
-    let present = installed::scan(&venv).contains(&analysis.name);
+    let env = crate::core::env::project_env(workspace);
+    let present = crate::core::env::importable(workspace, env.as_ref()).contains(&analysis.name);
     println!(
         "  {:<18}: {}",
         "installed",

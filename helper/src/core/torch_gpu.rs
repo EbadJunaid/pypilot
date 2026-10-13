@@ -1,4 +1,4 @@
-//! Does the torch in `.venv` actually use the NVIDIA GPU?
+//! Does the torch in the project's environment actually use the NVIDIA GPU?
 //!
 //! F2 picks the right CUDA index when PyPilot installs torch, but the result
 //! does not stay put: torch may have come from the default index first (on
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::core::gpu::{self, Accelerator};
 use crate::core::platform::{Arch, Os, Platform};
 use crate::core::project::Requirement;
-use crate::core::{command, installed, pip};
+use crate::core::{command, installed};
 use crate::core::{Finding, FixKind, Severity};
 use crate::matrix;
 use crate::settings::Settings;
@@ -164,6 +164,15 @@ pub async fn static_check(venv: &Path, settings: &Settings) -> Option<Finding> {
     let Accelerator::Nvidia { name, .. } = gpu::detect().await else {
         return None;
     };
+    // In a pixi prefix (a conda environment) a pip reinstall is the wrong
+    // advice: pixi owns the environment and undoes it on the next install.
+    if venv.join("conda-meta").is_dir() {
+        let mut finding = cpu_torch_finding(&build, &version, &name, None)?;
+        finding.detail = format!(
+            "{name} is present, but torch {version} in the pixi environment is a CPU-only build, so torch.cuda.is_available() returns False and everything runs on the CPU. Ask pixi for a CUDA build instead of reinstalling with pip, which the next `pixi install` would undo: take torch from conda-forge (`pixi add pytorch-gpu`, with `cuda` set under `[system-requirements]`), or point `[pypi-options]` at the PyTorch CUDA index matched to your driver."
+        );
+        return Some(finding);
+    }
     let reinstall = match matched_index(&version, settings).await {
         // The driver is too old for every CUDA build, so CPU is right; F2
         // already says so in its own finding.
@@ -273,13 +282,12 @@ fn supports_capability(arch_list: &[String], major: u32, minor: u32) -> bool {
     })
 }
 
-/// Ask the venv's torch whether it can see the GPU. `None` when there is no
-/// NVIDIA GPU to check against.
-pub async fn self_test(venv: &Path, workspace: &Path) -> Option<Result<String, String>> {
+/// Ask the torch of the environment whose interpreter is `python` whether it
+/// can see the GPU. `None` when there is no NVIDIA GPU to check against.
+pub async fn self_test(python: &Path, workspace: &Path) -> Option<Result<String, String>> {
     let Accelerator::Nvidia { name, .. } = gpu::detect().await else {
         return None;
     };
-    let python = pip::venv_python(venv);
     // -I: the workspace must not shadow torch with a local `torch.py`.
     let args = ["-I", "-c", SELF_TEST_SCRIPT];
     let result =

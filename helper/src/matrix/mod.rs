@@ -159,8 +159,10 @@ pub async fn check(
             // GPU even when the declared requirement solves cleanly, e.g. a
             // cu121 wheel carried over from before an RTX 50-series upgrade.
             if Framework::from_package_name(&req.name) == Some(Framework::Torch) {
-                let venv = workspace.join(".venv");
-                findings.extend(solve::check_installed_torch(&venv, &solved, settings).await);
+                if let Some(env) = crate::core::env::project_env(workspace) {
+                    findings
+                        .extend(solve::check_installed_torch(&env.path, &solved, settings).await);
+                }
             }
             findings.extend(solved.finding);
         }

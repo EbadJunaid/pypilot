@@ -141,14 +141,19 @@ const GPU_CHECK_STEP: &str = "GPU check";
 /// CPU build or an unsupported CUDA build is cheapest to notice. Non-fatal:
 /// torch did install, so a mismatch is recorded as a failed step that says
 /// why, without clearing [`SetupSummary::ok`]. Skipped when the run already
-/// failed, when there is no `.venv` or torch in it, and on machines without
+/// failed, when there is no environment or torch in it, and on machines without
 /// an NVIDIA GPU.
 pub(crate) async fn verify_gpu(workspace: &Path, summary: &mut SetupSummary) {
-    let venv = workspace.join(".venv");
-    if summary.failed() || !venv.is_dir() || !installed::scan(&venv).contains("torch") {
+    if summary.failed() {
         return;
     }
-    match crate::core::torch_gpu::self_test(&venv, workspace).await {
+    let Some(env) = crate::core::env::project_env(workspace) else {
+        return;
+    };
+    if !installed::scan(&env.path).contains("torch") {
+        return;
+    }
+    match crate::core::torch_gpu::self_test(&env.python_exe, workspace).await {
         Some(Ok(detail)) => step_ok(summary, GPU_CHECK_STEP, &detail),
         Some(Err(why)) => soft_fail(summary, GPU_CHECK_STEP, &why),
         None => {}
