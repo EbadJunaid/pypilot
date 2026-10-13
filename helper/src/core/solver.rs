@@ -1015,6 +1015,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// pixi also manages C++ and Rust workspaces: one with no `python`, no
+    /// PyPI dependency and no Python file gets no pixi environment warning.
+    #[tokio::test]
+    async fn non_python_pixi_workspace_is_silent() {
+        let root = std::env::temp_dir().join(format!("pypilot-pixi-cpp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("pixi.toml"),
+            "[workspace]\nchannels = [\"conda-forge\"]\nplatforms = [\"win-64\", \"linux-64\"]\n\n[dependencies]\ncmake = \">=3.28\"\ncxx-compiler = \"*\"\nninja = \"*\"\n\n[tasks]\nbuild = \"cmake --build build\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+        let settings = crate::settings::Settings {
+            data_refresh_days: 0,
+            ..Default::default()
+        };
+        let a = assess(&root, &settings, &crate::pypi::FixtureSource::new()).await;
+        assert!(a.project.is_pixi());
+        assert!(!a.project.is_python_project());
+        assert!(a.findings.is_empty(), "{:?}", a.findings);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn not_a_python_project_is_silent() {
         let (target, findings) = synthesize(&EnvSummary::default(), &ProjectDeps::default(), None);

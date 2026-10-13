@@ -116,7 +116,10 @@ pub fn scan(workspace: &Path) -> ProjectDeps {
     // A pixi project is a Python project: its PyPI dependencies are checked
     // like any other, and its conda ones are recorded but kept off PyPI.
     // pixi's python spec is what decides the interpreter, so it outranks a
-    // pyproject's `requires-python`.
+    // pyproject's `requires-python`. A pixi workspace that asks for neither
+    // Python nor PyPI packages (a C++ or Rust one) is still pixi's, but its
+    // manifest alone does not make it a Python project: only Python or
+    // notebook files next to it do, as for any folder (checked below).
     if let Some(pixi) = crate::core::pixi::detect(workspace) {
         names.extend(pixi.pypi_deps.iter().cloned());
         if let Some(rp) = pixi
@@ -127,7 +130,7 @@ pub fn scan(workspace: &Path) -> ProjectDeps {
             deps.declared_requires_python = Some(rp);
         }
         deps.conda_deps = pixi.conda_deps.clone();
-        if !deps.sources.contains(&pixi.manifest) {
+        if pixi.uses_python() && !deps.sources.contains(&pixi.manifest) {
             deps.sources.push(pixi.manifest.clone());
         }
         deps.pixi_manifest = Some(pixi.manifest);
@@ -951,6 +954,26 @@ requests = "^2.31"
         assert_eq!(deps.conda_deps.len(), 1);
         assert_eq!(deps.conda_deps[0].name, "numpy");
         assert_eq!(deps.declared_requires_python.as_deref(), Some("==3.12.*"));
+    }
+
+    #[test]
+    fn a_pixi_workspace_without_python_is_not_a_python_project() {
+        let dir = fresh_dir("pypilot-scan-pixi-cpp");
+        std::fs::write(
+            dir.join("pixi.toml"),
+            "[workspace]\nchannels = [\"conda-forge\"]\nplatforms = [\"linux-64\"]\n\n[dependencies]\ncmake = \"*\"\ncxx-compiler = \"*\"\n",
+        )
+        .unwrap();
+        touch(&dir.join("main.cpp"));
+        let deps = scan(&dir);
+        assert!(deps.is_pixi());
+        assert!(!deps.is_python_project());
+        assert!(deps.sources.is_empty());
+
+        // A Python script next to it makes it one again.
+        touch(&dir.join("build.py"));
+        assert!(scan(&dir).is_python_project());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

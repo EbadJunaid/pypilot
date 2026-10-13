@@ -84,6 +84,21 @@ pub struct PixiProject {
     pub features: Vec<PixiFeature>,
 }
 
+impl PixiProject {
+    /// Does the manifest ask for Python at all: a `python` dependency or a
+    /// PyPI dependency, in the default set or any feature? pixi also manages
+    /// C++, Rust and R workspaces, which have neither.
+    pub fn uses_python(&self) -> bool {
+        self.python.is_some()
+            || !self.pypi_deps.is_empty()
+            || self.skipped_pypi_deps > 0
+            || self
+                .features
+                .iter()
+                .any(|f| f.python.is_some() || !f.pypi_deps.is_empty())
+    }
+}
+
 /// An installed pixi environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PixiEnv {
