@@ -17,7 +17,7 @@ use crate::core::uv;
 use crate::core::{Assessment, Finding, FixKind, Severity};
 use crate::matrix;
 use crate::pypi::metadata::{PackageAnalysis, SdistKind};
-use crate::pypi::pyversion::PyVersion;
+use crate::pypi::pyversion::{PyVersion, PyVersionSet};
 use crate::pypi::{self, CompatReport, MetadataSource};
 use crate::settings::{PackageManager, Settings};
 
@@ -334,7 +334,7 @@ pub fn synthesize(
         return (None, findings);
     }
 
-    let target = compat.suggested_python();
+    let target = pick_target(project, compat);
 
     // The broken-venv finding already asks for a rebuild, which lands on
     // `target`; judging the dead interpreter's version would only add noise.
@@ -415,6 +415,57 @@ pub fn synthesize(
     }
 
     (target, findings)
+}
+
+/// The Pythons a pixi project's `python` spec allows, when it is a pixi
+/// project whose spec narrows Python at all.
+fn pixi_python_window(project: &ProjectDeps) -> Option<PyVersionSet> {
+    if !project.is_pixi() {
+        return None;
+    }
+    crate::core::pixi::python_spec_set(project.pixi_python.as_deref()?)
+}
+
+/// The interpreter to aim for: the newest every dependency supports. In a
+/// pixi project it must also be one the manifest's `python` spec allows,
+/// since that is what pixi installs; when the spec excludes every supported
+/// Python, the dependencies' choice stands and the project has to move to it
+/// (`pixi add python=X.Y`, see [`recommendation`]).
+fn pick_target(project: &ProjectDeps, compat: &CompatReport) -> Option<PyVersion> {
+    match pixi_python_window(project) {
+        Some(window) => compat
+            .intersection
+            .intersect(&window)
+            .max()
+            .or_else(|| compat.suggested_python()),
+        None => compat.suggested_python(),
+    }
+}
+
+/// The recommended-Python line of a report (doctor, the LSP report), for the
+/// `target` [`synthesize`] chose. In a pixi project it is measured against
+/// the manifest's `python` spec as written, and says so when that spec rules
+/// out every Python the dependencies support.
+pub fn recommendation(
+    project: &ProjectDeps,
+    compat: &CompatReport,
+    target: Option<PyVersion>,
+) -> Option<String> {
+    let target = target?;
+    let (Some(window), Some(spec)) = (pixi_python_window(project), project.pixi_python.as_deref())
+    else {
+        return Some(format!("Python {target}"));
+    };
+    if window.contains(target) {
+        Some(format!(
+            "Python {target} (newest the dependencies support within pixi's `python {spec}`)"
+        ))
+    } else {
+        Some(format!(
+            "none within pixi's `python {spec}`: the dependencies support Python {}. Run `pixi add python={target}` to move the project to Python {target}",
+            compat.intersection.to_range_string()
+        ))
+    }
 }
 
 /// The finding for a pixi project whose environment pixi has not built yet.
@@ -570,7 +621,6 @@ fn capping_clause(compat: &CompatReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pypi::pyversion::PyVersionSet;
 
     fn analysis(name: &str, minors: &[u8]) -> PackageAnalysis {
         PackageAnalysis {
@@ -954,6 +1004,58 @@ mod tests {
         assert_eq!(
             findings[0].fix,
             FixKind::RecreateWithPython(PyVersion::py3(12))
+        );
+    }
+
+    fn pinned_pixi_project(spec: &str) -> ProjectDeps {
+        ProjectDeps {
+            packages: vec![Requirement::any("requests")],
+            pixi_python: Some(spec.to_string()),
+            ..pixi_project()
+        }
+    }
+
+    #[test]
+    fn pixi_recommendation_stays_inside_the_python_spec() {
+        // requests runs on every tracked Python, but pixi installs 3.12.
+        let compat = report(vec![analysis("requests", &[9, 10, 11, 12, 13, 14])]);
+        let env = EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(12)),
+            ..Default::default()
+        };
+        let project = pinned_pixi_project("3.12.*");
+        let (target, findings) = synthesize(&env, &project, Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(12)));
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(
+            recommendation(&project, &compat, target).as_deref(),
+            Some("Python 3.12 (newest the dependencies support within pixi's `python 3.12.*`)")
+        );
+
+        // A range: the newest both allow.
+        let project = pinned_pixi_project(">=3.10,<3.14");
+        let (target, _) = synthesize(&env, &project, Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(13)));
+
+        // No spec, or not pixi: the dependencies alone decide.
+        let (target, _) = synthesize(&env, &pixi_project(), Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(14)));
+        assert_eq!(
+            recommendation(&pixi_project(), &compat, target).as_deref(),
+            Some("Python 3.14")
+        );
+    }
+
+    #[test]
+    fn pixi_spec_excluding_every_supported_python_says_so() {
+        let compat = report(vec![analysis("tensorflow", &[9, 10, 11])]);
+        let project = pinned_pixi_project("3.12.*");
+        let (target, _) = synthesize(&EnvSummary::default(), &project, Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(11)));
+        assert_eq!(
+            recommendation(&project, &compat, target).as_deref(),
+            Some("none within pixi's `python 3.12.*`: the dependencies support Python 3.9–3.11. Run `pixi add python=3.11` to move the project to Python 3.11")
         );
     }
 

@@ -62,6 +62,9 @@ pub struct ProjectDeps {
     /// excluded). Kept apart from [`ProjectDeps::packages`]: conda names are
     /// not PyPI names, so they never go to the PyPI compatibility engine.
     pub conda_deps: Vec<crate::core::pixi::CondaDep>,
+    /// The pixi default environment's `python` spec as written in the
+    /// manifest (`3.12.*`), which decides the interpreter pixi installs.
+    pub pixi_python: Option<String>,
 }
 
 impl ProjectDeps {
@@ -130,6 +133,7 @@ pub fn scan(workspace: &Path) -> ProjectDeps {
             deps.declared_requires_python = Some(rp);
         }
         deps.conda_deps = pixi.conda_deps.clone();
+        deps.pixi_python = pixi.python.clone();
         if pixi.uses_python() && !deps.sources.contains(&pixi.manifest) {
             deps.sources.push(pixi.manifest.clone());
         }
@@ -954,6 +958,7 @@ requests = "^2.31"
         assert_eq!(deps.conda_deps.len(), 1);
         assert_eq!(deps.conda_deps[0].name, "numpy");
         assert_eq!(deps.declared_requires_python.as_deref(), Some("==3.12.*"));
+        assert_eq!(deps.pixi_python.as_deref(), Some("3.12.*"));
     }
 
     #[test]

@@ -99,7 +99,20 @@ pub async fn run<S: MetadataSource>(
             .collect::<Vec<_>>()
             .join(", ");
         println!("  {:<16}: {files}", "files");
-        if let Some(rp) = &a.project.declared_requires_python {
+        // pixi installs the Python its manifest asks for, so show that spec
+        // as written rather than its PEP 440 translation.
+        if let Some(spec) = a
+            .project
+            .pixi_python
+            .as_ref()
+            .filter(|_| a.project.is_pixi())
+        {
+            println!(
+                "  {:<16}: {}",
+                "pixi python",
+                format!("python {spec}").green().bold()
+            );
+        } else if let Some(rp) = &a.project.declared_requires_python {
             println!(
                 "  {:<16}: {}",
                 "requires-python",
@@ -130,12 +143,8 @@ pub async fn run<S: MetadataSource>(
             "supported Python",
             compat.intersection.to_range_string().green().bold()
         );
-        if let Some(t) = a.target_python {
-            println!(
-                "  {:<16}: {}",
-                "recommended",
-                format!("Python {t}").cyan().bold()
-            );
+        if let Some(text) = solver::recommendation(&a.project, compat, a.target_python) {
+            println!("  {:<16}: {}", "recommended", text.cyan().bold());
         }
         for p in &compat.per_package {
             let sdist_note = if p.sdist_only {

@@ -1010,8 +1010,9 @@ fn details_markdown(a: &Assessment) -> String {
             "- Supported Python across dependencies: **{}**\n",
             compat.intersection.to_range_string()
         ));
-        if let Some(t) = a.target_python {
-            s.push_str(&format!("- Recommended interpreter: **Python {t}**\n"));
+        if let Some(text) = crate::core::solver::recommendation(&a.project, compat, a.target_python)
+        {
+            s.push_str(&format!("- Recommended interpreter: **{text}**\n"));
         }
         s.push_str("\n| Package | Supported Python |\n|---|---|\n");
         for p in &compat.per_package {

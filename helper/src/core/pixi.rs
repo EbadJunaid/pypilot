@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::core::command;
 use crate::core::installed;
 use crate::core::project::{self, normalize_name, Requirement};
-use crate::pypi::pyversion::{Clause, PyVersion};
+use crate::pypi::pyversion::{Clause, PyVersion, PyVersionSet};
 
 /// The name pixi gives the environment built from the top-level tables.
 pub const DEFAULT_ENV: &str = "default";
@@ -367,6 +367,19 @@ pub fn python_spec_minor(spec: &str) -> Option<PyVersion> {
 const MINOR_CEILING: u8 = 99;
 
 fn alternative_max_minor(spec: &str) -> Option<PyVersion> {
+    let clauses = alternative_clauses(spec)?;
+    if allows_minor(&clauses, MINOR_CEILING) {
+        return None;
+    }
+    (0..MINOR_CEILING)
+        .rev()
+        .find(|&m| allows_minor(&clauses, m))
+        .map(PyVersion::py3)
+}
+
+/// The comparators of one `|` alternative, as PEP 440 clauses. `None` for
+/// `*`, an empty spec or one that does not parse.
+fn alternative_clauses(spec: &str) -> Option<Vec<Clause>> {
     // A build string can follow the version after whitespace (`3.12.* *_cp`),
     // but spaces inside the version (`>=3.10, <3.13`, `>= 3.10`) are not one.
     let version = join_version_spaces(spec);
@@ -380,22 +393,33 @@ fn alternative_max_minor(spec: &str) -> Option<PyVersion> {
         .filter(|c| !c.is_empty())
         .map(|c| Clause::parse(&conda_clause_to_pep440(c)))
         .collect::<Option<_>>()?;
-    if clauses.is_empty() {
-        return None;
+    (!clauses.is_empty()).then_some(clauses)
+}
+
+/// Does some 3.`minor`.x release satisfy every clause?
+fn allows_minor(clauses: &[Clause], minor: u8) -> bool {
+    (0..=MINOR_CEILING as u64).any(|patch| {
+        let candidate = [3, minor as u64, patch];
+        clauses.iter().all(|c| c.matches(&candidate))
+    })
+}
+
+/// The tracked Python minors a raw conda python spec allows: `3.12.*` gives
+/// 3.12, `>=3.11` gives 3.11 up to the newest tracked one. `None` when the
+/// spec does not narrow Python (`*`, or an alternative that is `*`) or cannot
+/// be read, so callers fall back to the dependencies alone. An empty set means
+/// the spec asks only for Pythons outside the tracked range.
+pub fn python_spec_set(spec: &str) -> Option<PyVersionSet> {
+    let mut set = PyVersionSet::empty();
+    for alternative in spec.split('|') {
+        let clauses = alternative_clauses(alternative)?;
+        for v in PyVersionSet::universe().iter() {
+            if allows_minor(&clauses, v.minor) {
+                set.insert(v);
+            }
+        }
     }
-    let allows = |minor: u8| {
-        (0..=MINOR_CEILING as u64).any(|patch| {
-            let candidate = [3, minor as u64, patch];
-            clauses.iter().all(|c| c.matches(&candidate))
-        })
-    };
-    if allows(MINOR_CEILING) {
-        return None;
-    }
-    (0..MINOR_CEILING)
-        .rev()
-        .find(|&m| allows(m))
-        .map(PyVersion::py3)
+    Some(set)
 }
 
 /// A conda python spec as a PEP 440 specifier (`3.12.*` -> `==3.12.*`,
@@ -1098,6 +1122,24 @@ platforms = ["win-64", { platform = "linux-64", cuda = "12.0" }]
                 want.map(PyVersion::py3),
                 "spec {spec:?}"
             );
+        }
+    }
+
+    #[test]
+    fn python_spec_sets() {
+        let set = |spec: &str| python_spec_set(spec).map(|s| s.to_range_string());
+        assert_eq!(set("3.12.*").as_deref(), Some("3.12"));
+        assert_eq!(set("3.12").as_deref(), Some("3.12"));
+        assert_eq!(set(">=3.10, <3.13").as_deref(), Some("3.10–3.12"));
+        assert_eq!(set("3.9.*|3.11.*").as_deref(), Some("3.9, 3.11"));
+        assert_eq!(set("3.12.* *_cpython").as_deref(), Some("3.12"));
+        // Open-ended: up to the newest tracked minor, unlike the hint.
+        let newest = PyVersionSet::universe().max().unwrap();
+        assert_eq!(set(">=3.11"), Some(format!("3.11–{newest}")));
+        // Outside the tracked range: known, but empty.
+        assert_eq!(set("3.99.*").as_deref(), Some("none"));
+        for none in ["*", "", "banana", "3.12.*|*"] {
+            assert_eq!(python_spec_set(none), None, "{none:?}");
         }
     }
 
