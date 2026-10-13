@@ -48,7 +48,11 @@ pub async fn run<S: MetadataSource>(
     match &a.probes.venv {
         Some(v) => println!(
             "  {:<16}: {} ({})",
-            "virtualenv",
+            if v.kind.is_pixi() {
+                "pixi env"
+            } else {
+                "virtualenv"
+            },
             v.path.display(),
             v.python
                 .map(|p| format!("Python {p}").green().bold().to_string())

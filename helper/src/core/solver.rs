@@ -141,7 +141,8 @@ async fn confirm_with_uv(
     project: &ProjectDeps,
     workspace: &Path,
 ) -> Option<Finding> {
-    if settings.package_manager != PackageManager::Uv {
+    // pixi resolves a pixi project (conda packages included), not uv.
+    if settings.package_manager != PackageManager::Uv || project.is_pixi() {
         return None;
     }
     let uv_info = probes.uv.as_ref()?;
@@ -182,12 +183,25 @@ pub fn synthesize(
     compat: Option<&CompatReport>,
 ) -> (Option<PyVersion>, Vec<Finding>) {
     let mut findings = Vec::new();
+    // A pixi project's environment is pixi's prefix, and every fix goes
+    // through pixi (see `crate::core::pixi_manage`), so its findings say so.
+    let pixi = project.is_pixi();
 
     // A venv whose Python is gone can't run anything, so every other verdict
     // about it (its version, its kernel) is moot. Say that one thing, ahead of
     // the Python-project gate: the `.venv` alone is reason enough.
     let broken = env.venv_missing_python.as_ref().filter(|_| env.has_venv);
-    if let Some(missing) = broken {
+    if let Some(missing) = broken.filter(|_| pixi) {
+        findings.push(Finding {
+            severity: Severity::Error,
+            title: format!(
+                "The pixi environment is broken: its Python at {} is missing",
+                missing.display()
+            ),
+            detail: "The environment's interpreter is gone (deleted, or the install was interrupted), so nothing can run in it. Reinstall it with `pixi install`.".to_string(),
+            fix: FixKind::SetupEnvironment,
+        });
+    } else if let Some(missing) = broken {
         findings.push(Finding {
             severity: Severity::Error,
             title: format!(
@@ -206,7 +220,11 @@ pub fn synthesize(
     if env.has_venv && broken.is_none() && env.has_notebooks && !env.venv_has_ipykernel {
         findings.push(Finding {
             severity: Severity::Warning,
-            title: "Notebooks can't use .venv yet".to_string(),
+            title: if pixi {
+                "Notebooks can't use the pixi environment yet".to_string()
+            } else {
+                "Notebooks can't use .venv yet".to_string()
+            },
             detail: "This project has Jupyter notebooks, but its environment has no usable ipykernel (on Python 3.14, ipykernel 7.0.0 and releases before 6.30.1 cannot connect), so VS Code and Jupyter can't offer it as a kernel and fall back to another Python where the project's packages are missing. Set up the environment to install ipykernel.".to_string(),
             fix: FixKind::SetupEnvironment,
         });
@@ -218,7 +236,8 @@ pub fn synthesize(
     }
 
     // Conda projects: detect + offer migration, don't fight conda in v1.
-    if project.has_conda_env {
+    // pixi already manages a pixi project's conda packages.
+    if project.has_conda_env && !pixi {
         findings.push(Finding {
             severity: Severity::Info,
             title: "Conda environment detected".to_string(),
@@ -229,7 +248,11 @@ pub fn synthesize(
 
     let Some(compat) = compat else {
         // Python files but no declared dependencies to check.
-        if !env.has_venv {
+        if !env.has_venv && pixi {
+            findings.push(pixi_not_installed(
+                "This pixi project's environment has not been installed yet, so nothing in it can run. Run `pixi install` to create it.".to_string(),
+            ));
+        } else if !env.has_venv {
             findings.push(Finding {
                 severity: Severity::Warning,
                 title: "No virtual environment".to_string(),
@@ -300,6 +323,14 @@ pub fn synthesize(
         // Venv exists but its Python is unsupported → recreate on the right version.
         Some(current) => {
             let mut why = incompat_reason(compat, current, target);
+            if let (true, Some(t)) = (pixi, target) {
+                why = why.replace(
+                    &format!("Recreate the environment with Python {t}."),
+                    &format!(
+                        "Move the project to it with `pixi add python={t}` (then `pixi install`)."
+                    ),
+                );
+            }
             why.push_str(&wheel_gap_note(compat, current, target, env.toolchain));
             findings.push(Finding {
                 severity: Severity::Error,
@@ -309,6 +340,32 @@ pub fn synthesize(
                     .map(FixKind::RecreateWithPython)
                     .unwrap_or(FixKind::Manual),
             });
+        }
+
+        // A pixi environment without a Python: the manifest never asked for
+        // one, so `pixi install` alone will not add it.
+        None if pixi && env.has_venv => {
+            let range = compat.intersection.to_range_string();
+            let ask = target
+                .map(|t| format!(" Add one with `pixi add python={t}`."))
+                .unwrap_or_default();
+            findings.push(Finding {
+                severity: Severity::Warning,
+                title: "The pixi environment has no Python".to_string(),
+                detail: format!(
+                    "The project's PyPI dependencies need Python {range}, but its pixi manifest does not ask for Python.{ask}"
+                ),
+                fix: target
+                    .map(FixKind::RecreateWithPython)
+                    .unwrap_or(FixKind::Manual),
+            });
+        }
+
+        None if pixi => {
+            let range = compat.intersection.to_range_string();
+            findings.push(pixi_not_installed(format!(
+                "This pixi project's environment has not been installed yet. Its PyPI dependencies support Python {range}. Run `pixi install` to create it."
+            )));
         }
 
         // No venv (or unknown version) → set one up on the correct interpreter.
@@ -331,6 +388,16 @@ pub fn synthesize(
     }
 
     (target, findings)
+}
+
+/// The finding for a pixi project whose environment pixi has not built yet.
+fn pixi_not_installed(detail: String) -> Finding {
+    Finding {
+        severity: Severity::Warning,
+        title: "Pixi environment not installed yet".to_string(),
+        detail,
+        fix: FixKind::SetupEnvironment,
+    }
 }
 
 /// Would installing the project compile anything from source? True for any
@@ -790,6 +857,133 @@ mod tests {
         let (_t, findings) = synthesize(&env, &ProjectDeps::default(), None);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].fix, FixKind::SetupEnvironment);
+    }
+
+    fn pixi_project() -> ProjectDeps {
+        ProjectDeps {
+            sources: vec!["pixi.toml".into()],
+            packages: vec![Requirement::any("mediapipe")],
+            pixi_manifest: Some("pixi.toml".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uninstalled_pixi_env_gets_the_pixi_wording() {
+        let compat = report(vec![analysis("mediapipe", &[9, 10, 11, 12])]);
+        let (target, findings) = synthesize(&EnvSummary::default(), &pixi_project(), Some(&compat));
+        assert_eq!(target, Some(PyVersion::py3(12)));
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].title, "Pixi environment not installed yet");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].fix, FixKind::SetupEnvironment);
+        assert!(findings[0].detail.contains("pixi install"));
+
+        // No dependencies to check: same finding, never "No virtual environment".
+        let project = ProjectDeps {
+            packages: Vec::new(),
+            ..pixi_project()
+        };
+        let (_, findings) = synthesize(&EnvSummary::default(), &project, None);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "Pixi environment not installed yet");
+    }
+
+    #[test]
+    fn installed_pixi_env_is_judged_like_a_venv() {
+        let compat = report(vec![analysis("mediapipe", &[9, 10, 11, 12])]);
+        let ok = EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(12)),
+            ..Default::default()
+        };
+        let (_, findings) = synthesize(&ok, &pixi_project(), Some(&compat));
+        assert!(findings.is_empty(), "{findings:?}");
+
+        let wrong = EnvSummary {
+            venv_python: Some(PyVersion::py3(13)),
+            ..ok.clone()
+        };
+        let (_, findings) = synthesize(&wrong, &pixi_project(), Some(&compat));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].fix,
+            FixKind::RecreateWithPython(PyVersion::py3(12))
+        );
+        assert!(
+            findings[0].detail.contains("`pixi add python=3.12`"),
+            "{}",
+            findings[0].detail
+        );
+
+        let no_python = EnvSummary {
+            venv_python: None,
+            ..ok
+        };
+        let (_, findings) = synthesize(&no_python, &pixi_project(), Some(&compat));
+        assert_eq!(findings[0].title, "The pixi environment has no Python");
+        assert_eq!(
+            findings[0].fix,
+            FixKind::RecreateWithPython(PyVersion::py3(12))
+        );
+    }
+
+    #[test]
+    fn broken_pixi_env_asks_for_pixi_install() {
+        let env = EnvSummary {
+            has_venv: true,
+            venv_missing_python: Some(PathBuf::from("proj/.pixi/envs/default/python.exe")),
+            ..Default::default()
+        };
+        let (_, findings) = synthesize(&env, &pixi_project(), None);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0]
+            .title
+            .starts_with("The pixi environment is broken"));
+        assert!(findings[0].detail.contains("pixi install"));
+    }
+
+    /// End to end: a pixi project whose environment pixi installed gets no
+    /// "no environment" finding, and the probe reports the pixi prefix.
+    #[tokio::test]
+    async fn assess_finds_the_pixi_environment() {
+        let (root, prefix) = crate::core::env::tests::pixi_fixture("assess", true);
+        std::fs::write(
+            root.join("pixi.toml"),
+            "[workspace]\nchannels = [\"conda-forge\"]\nplatforms = [\"win-64\"]\n\n[dependencies]\npython = \"3.12.*\"\nnumpy = \"*\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.py"), "import numpy\n").unwrap();
+        let settings = crate::settings::Settings {
+            data_refresh_days: 0,
+            ..Default::default()
+        };
+        let a = assess(&root, &settings, &crate::pypi::FixtureSource::new()).await;
+        let venv = a.probes.venv.as_ref().expect("the pixi env is found");
+        assert_eq!(venv.path, prefix);
+        assert!(venv.kind.is_pixi());
+        assert_eq!(venv.python, Some(PyVersion::py3(12)));
+        assert!(a.project.is_pixi());
+        assert!(a.compat.is_none(), "conda deps never go to PyPI");
+        assert!(
+            a.findings
+                .iter()
+                .all(|f| !f.title.contains("environment") && !f.title.contains("virtual")),
+            "{:?}",
+            a.findings
+        );
+
+        // Before `pixi install`: the pixi wording, not the venv one.
+        std::fs::remove_dir_all(root.join(".pixi")).unwrap();
+        let a = assess(&root, &settings, &crate::pypi::FixtureSource::new()).await;
+        assert!(a.probes.venv.is_none());
+        let titles: Vec<&str> = a.findings.iter().map(|f| f.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Pixi environment not installed yet"),
+            "{titles:?}"
+        );
+        assert!(!titles.contains(&"No virtual environment"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

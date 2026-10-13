@@ -930,8 +930,14 @@ fn all_good_summary(a: &Assessment) -> String {
         .probes
         .venv
         .as_ref()
-        .and_then(|v| v.python)
-        .map(|p| format!("Python {p} venv"))
+        .and_then(|v| Some((v.python?, v.kind.is_pixi())))
+        .map(|(p, pixi)| {
+            if pixi {
+                format!("Python {p} pixi environment")
+            } else {
+                format!("Python {p} venv")
+            }
+        })
         .unwrap_or_else(|| "environment".into());
     match &a.compat {
         Some(compat) => format!(
@@ -972,7 +978,12 @@ fn details_markdown(a: &Assessment) -> String {
             .unwrap_or_else(|| "not detected".into())
     ));
     s.push_str(&format!(
-        "- virtualenv: {}\n",
+        "- {}: {}\n",
+        if a.project.is_pixi() {
+            "pixi environment"
+        } else {
+            "virtualenv"
+        },
         a.probes
             .venv
             .as_ref()
