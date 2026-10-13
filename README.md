@@ -49,6 +49,14 @@ When `uv` is unavailable on the system or `package_manager = "pip"` is explicitl
 - Dependencies are installed using `pip install`.
 - After each installation or dependency modification, PyPilot runs `pip freeze > requirements.txt` to update the file with pinned versions. This keeps your dependencies documented and reproducible even without a lockfile manager.
 
+### pixi projects
+Projects managed by [pixi](https://pixi.sh) (a `pixi.toml`, or `[tool.pixi.workspace]` in `pyproject.toml`) are detected automatically, whatever `package_manager` says. PyPilot then works through pixi and never creates a `.venv`, runs uv or touches `pixi.lock`:
+- The environment is pixi's (`.pixi/envs/default`). Its Python version, installed packages and GPU builds are read from there, so import diagnostics and findings are accurate.
+- Setup runs `pixi install`; installing a package runs `pixi add --pypi <package>`; moving to another Python runs `pixi add python=X.Y`.
+- PyPI dependencies are checked against the environment's Python. When one has no wheel for it, PyPilot names the package and the fix (`pixi add python=3.11`), and turns pixi's own install errors into the same plain explanation.
+- The recommended Python respects the manifest's `python` spec, and doctor lists conda and PyPI dependencies separately.
+- If pixi is not installed, PyPilot says so and changes nothing.
+
 ## Installation
 
 Install PyPilot from Zed's extension panel. When you open a Python folder, the extension automatically inspects the environment and opens a notification if action is required.
