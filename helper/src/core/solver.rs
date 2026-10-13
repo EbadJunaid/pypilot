@@ -67,6 +67,28 @@ impl EnvSummary {
     }
 }
 
+/// `packages` minus those whose resolved release publishes no files for this
+/// platform, matched by normalized name.
+fn installable_packages(
+    packages: &[crate::core::project::Requirement],
+    compat: Option<&CompatReport>,
+) -> Vec<crate::core::project::Requirement> {
+    let Some(compat) = compat else {
+        return packages.to_vec();
+    };
+    let blocked: std::collections::HashSet<String> = compat
+        .per_package
+        .iter()
+        .filter(|a| a.no_files_for_platform)
+        .map(|a| crate::core::project::normalize_name(&a.name))
+        .collect();
+    packages
+        .iter()
+        .filter(|r| !blocked.contains(&crate::core::project::normalize_name(&r.name)))
+        .cloned()
+        .collect()
+}
+
 /// Full read-only assessment of a workspace (F5 / doctor).
 pub async fn assess<S: MetadataSource>(
     workspace: &Path,
@@ -82,8 +104,11 @@ pub async fn assess<S: MetadataSource>(
         Some(pypi::analyze(source, Platform::current(), &project.packages).await)
     };
 
-    // F2 seam (empty in Phase 1).
-    let hardware = matrix::check(workspace, settings, &project.packages).await;
+    // Hardware advice only makes sense for packages that can be installed here.
+    // A release with no files for this platform already gets its own finding,
+    // and a GPU note on top ("installs and runs CPU-only") would contradict it.
+    let installable = installable_packages(&project.packages, compat.as_ref());
+    let hardware = matrix::check(workspace, settings, &installable).await;
 
     let mut env = EnvSummary::from_probes(&probes, workspace);
     env.explained_source_builds = hardware.explained_source_builds;
@@ -1324,5 +1349,22 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.title == "Dependencies conflict on Python version"));
+    }
+
+    #[test]
+    fn hardware_checks_skip_packages_with_no_files_here() {
+        // tensorflow 2.15.0.post1 ships Linux wheels only: on Windows the GPU
+        // check must not describe how it "runs CPU-only" when it cannot install.
+        let mut tf = analysis("tensorflow", &[]);
+        tf.no_files_for_platform = true;
+        let compat = report(vec![tf, analysis("numpy", &[12])]);
+        let packages = vec![Requirement::any("TensorFlow"), Requirement::any("numpy")];
+
+        let names: Vec<String> = installable_packages(&packages, Some(&compat))
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["numpy"]);
+        assert_eq!(installable_packages(&packages, None).len(), 2);
     }
 }
