@@ -626,6 +626,100 @@ fn clean_version(line: &str) -> String {
         .to_string()
 }
 
+/// Why a pixi solve failed, read from its stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PixiError {
+    /// A PyPI release has no wheel for the environment's Python. `abi` is the
+    /// tag uv was looking for (`cp312`), when it says.
+    NoMatchingWheel {
+        package: String,
+        abi: Option<String>,
+    },
+    /// No such PyPI package.
+    NotFound {
+        package: String,
+    },
+    /// The conda or PyPI requirements conflict.
+    Unsolvable,
+    Other,
+}
+
+/// Classify the stderr of a failed `pixi add` / `pixi install`.
+pub fn classify_pixi_error(stderr: &str) -> PixiError {
+    let text = unwrap_report(stderr);
+    for phrase in [
+        " has no wheels with a matching Python ABI tag",
+        " have no wheels with a matching Python ABI tag",
+    ] {
+        if let Some(at) = text.find(phrase) {
+            if let Some(package) = last_requirement_name(&text[..at]) {
+                let abi = text[at..]
+                    .split_once("(e.g., `")
+                    .and_then(|(_, rest)| rest.split_once('`'))
+                    .map(|(tag, _)| tag.to_string())
+                    .filter(|t| !t.is_empty());
+                return PixiError::NoMatchingWheel { package, abi };
+            }
+        }
+    }
+    if let Some(at) = text.find(" was not found in the package registry") {
+        if let Some(package) = last_requirement_name(&text[..at]) {
+            return PixiError::NotFound { package };
+        }
+    }
+    let unsolvable = [
+        "Cannot solve the request because of",
+        "failed to solve requirements",
+        "failed to solve the pypi requirements",
+        "requirements are unsatisfiable",
+    ];
+    if unsolvable.iter().any(|p| text.contains(p)) {
+        return PixiError::Unsolvable;
+    }
+    PixiError::Other
+}
+
+/// The package named by the last word of `text` (`tensorflow==2.15.0`).
+fn last_requirement_name(text: &str) -> Option<String> {
+    project::requirement_name(text.split_whitespace().last()?)
+}
+
+/// Remove ANSI escape sequences. uv's part of pixi's messages arrives
+/// coloured even with `NO_COLOR=1` or `--color never`.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameters and intermediates, then one final byte in `@`..=`~`.
+            for n in chars.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Flatten a miette report into one line: colours stripped, the box-drawing
+/// gutter (`│ ├─▶ ╰─▶ ×`) removed, and hard wraps joined with a space.
+pub fn unwrap_report(text: &str) -> String {
+    let gutter =
+        |c: char| c.is_whitespace() || matches!(c, '│' | '├' | '╰' | '└' | '─' | '▶' | '×');
+    strip_ansi(text)
+        .lines()
+        .map(|l| l.trim_start_matches(gutter).trim_end())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1274,50 @@ platforms = ["win-64", { platform = "linux-64", cuda = "12.0" }]
         assert_eq!(origins["projb"], DistOrigin::Pypi);
         assert_eq!(origins["mystery"], DistOrigin::Unknown);
         assert!(dist_origins(&prefix.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn strips_ansi_colours() {
+        assert_eq!(
+            strip_ansi("(`\u{1b}[36mcp312\u{1b}[39m`) \u{1b}[36m\u{1b}[1mhint\u{1b}[0m"),
+            "(`cp312`) hint"
+        );
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// stderr captured verbatim from pixi 0.81.0, ANSI codes included.
+    #[test]
+    fn classifies_real_pixi_errors() {
+        let no_wheel = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-no-wheel.txt");
+        assert_eq!(
+            classify_pixi_error(no_wheel),
+            PixiError::NoMatchingWheel {
+                package: "tensorflow".into(),
+                abi: Some("cp312".into()),
+            }
+        );
+        let not_found = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-not-found.txt");
+        assert_eq!(
+            classify_pixi_error(not_found),
+            PixiError::NotFound {
+                package: "definitely-not-a-real-package-xyz".into()
+            }
+        );
+        let conflict = include_str!("../../tests/fixtures/pixi/pixi-0.81-err-conda-conflict.txt");
+        assert_eq!(classify_pixi_error(conflict), PixiError::Unsolvable);
+        assert_eq!(
+            classify_pixi_error("Error: network unreachable"),
+            PixiError::Other
+        );
+        assert_eq!(classify_pixi_error(""), PixiError::Other);
+    }
+
+    #[test]
+    fn unwraps_miette_reports() {
+        let text = "Error:   × failed to solve the pypi requirements of environment 'default' for\n  │ platform 'win-64'\n  ├─▶ failed to resolve pypi dependencies\n";
+        assert_eq!(
+            unwrap_report(text),
+            "Error:   × failed to solve the pypi requirements of environment 'default' for platform 'win-64' failed to resolve pypi dependencies"
+        );
     }
 }

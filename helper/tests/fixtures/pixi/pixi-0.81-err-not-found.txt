@@ -1,0 +1,7 @@
+Error:   × failed to solve the pypi requirements of environment 'default' for
+  │ platform 'win-64'
+  ├─▶ failed to resolve pypi dependencies
+  ╰─▶ Because definitely-not-a-real-package-xyz was not found in the package
+      registry and you require definitely-not-a-real-package-xyz, we can
+      conclude that your requirements are unsatisfiable.
+

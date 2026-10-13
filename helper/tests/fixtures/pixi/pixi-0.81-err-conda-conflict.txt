@@ -1,0 +1,58 @@
+Error:   × failed to solve requirements of environment 'default' for platform 'win-
+  │ 64'
+  ├─▶   × failed to solve the environment
+  │   
+  ╰─▶ Cannot solve the request because of: tensorflow * cannot be installed
+      because there are no viable options:
+      ├─ tensorflow 1.14.0 would require
+      │  └─ tensorflow-base ==1.14.0 py37hc8dfbb8_0, which cannot be installed
+      because there are no viable options:
+      │     └─ tensorflow-base 1.14.0 would require
+      │        └─ numpy >=1.16.1,<2.0.0a0, for which no candidates were found.
+      ├─ tensorflow 1.14.0 would require
+      │  └─ python_abi 3.6.* *_cp36m, which cannot be installed because there
+      are no viable options:
+      │     └─ python_abi 3.6 would require
+      │        └─ python 3.6.*, for which no candidates were found.
+      ├─ tensorflow 1.13.2 would require
+      │  └─ tensorflow-base ==1.13.2 py36_0, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.2 would require
+      │        └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ tensorflow-base ==1.13.1 py36_8, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.1 would require
+      │        └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ tensorflow-base ==1.13.1 py37_7, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.1 would require
+      │        └─ python >=3.7,<3.8.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ tensorflow-base ==1.13.1 py36_6, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.1 would require
+      │        └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ tensorflow-base ==1.13.1 py36_5, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.1 would require
+      │        └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ tensorflow-base ==1.13.1 py36_4, which cannot be installed because
+      there are no viable options:
+      │     └─ tensorflow-base 1.13.1 would require
+      │        └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.13.1 would require
+      │  └─ python >=3.7,<3.8.0a0, for which no candidates were found.
+      ├─ tensorflow 1.6.0 | 1.8.0 | ... | 1.13.1 would require
+      │  └─ python >=3.6,<3.7.0a0, for which no candidates were found.
+      ├─ tensorflow 1.6.0 | 1.8.0 | 1.9.0 | 1.10.0 would require
+      │  └─ python >=3.5,<3.6.0a0, for which no candidates were found.
+      ├─ tensorflow 1.2.0 | 1.2.1 | ... | 1.5.1 would require
+      │  └─ python 3.6.*, for which no candidates were found.
+      └─ tensorflow 0.12.1 | 1.0.0 | ... | 1.5.1 would require
+         └─ python 3.5.*, for which no candidates were found.
+      
+
