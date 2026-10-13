@@ -65,7 +65,7 @@ pub fn pixi_findings(
         );
         return vec![Finding {
             severity: Severity::Error,
-            title: "pixi's PyPI dependencies conflict on Python version".to_string(),
+            title: CONFLICT_TITLE.to_string(),
             detail: format!(
                 "{why} pixi cannot pick one Python for the environment, so `pixi add python=…` will not help; change or drop one of these PyPI dependencies.{skipped}"
             ),
@@ -132,16 +132,28 @@ pub fn pixi_findings(
 
     vec![Finding {
         severity: Severity::Error,
-        title: format!(
-            "{} {verb} not support Python {python} in this pixi environment",
-            names.join(", ")
-        ),
+        title: format!("{} {verb}{}", names.join(", "), mismatch_suffix(python)),
         detail: format!(
             "{from}, but {}. {consequence} Run `pixi add python={target}` to move the environment to Python {target}, the newest version every PyPI dependency supports.{skipped}",
             reasons.join("; ")
         ),
         fix: FixKind::Manual,
     }]
+}
+
+/// Title of the finding for PyPI dependencies with no common Python.
+pub const CONFLICT_TITLE: &str = "pixi's PyPI dependencies conflict on Python version";
+
+/// How a mismatch title ends: "tensorflow does[ not support Python 3.12 in
+/// this pixi environment]".
+fn mismatch_suffix(python: impl std::fmt::Display) -> String {
+    format!(" not support Python {python} in this pixi environment")
+}
+
+/// Is `title` this module's finding for dependencies that exclude Python
+/// `python` (as printed, `3.12`)?
+pub fn is_mismatch_title(title: &str, python: &str) -> bool {
+    title.ends_with(&mismatch_suffix(python))
 }
 
 /// " 2 PyPI dependencies given as git, path or url were not checked."

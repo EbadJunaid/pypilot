@@ -113,7 +113,8 @@ pub async fn assess<S: MetadataSource>(
     // pixi: PyPI dependencies that exclude the environment's Python, named
     // with the `pixi add python=…` that fixes them (core::pixi_compat).
     if let Some(pixi) = crate::core::pixi::detect(workspace) {
-        findings.extend(crate::core::pixi_compat::assess_default_env(&pixi, source).await);
+        let pixi_findings = crate::core::pixi_compat::assess_default_env(&pixi, source).await;
+        merge_pixi_findings(&mut findings, pixi_findings);
     }
 
     // F3's hybrid confirmation: metadata explains which package would be the
@@ -135,6 +136,46 @@ pub async fn assess<S: MetadataSource>(
         target_python,
         findings,
     }
+}
+
+/// Title of the finding for dependencies with no common Python.
+const CONFLICT_TITLE: &str = "Dependencies conflict on Python version";
+
+/// "Python 3.13[ is not supported by this project]".
+const UNSUPPORTED_SUFFIX: &str = " is not supported by this project";
+
+/// Fold the pixi findings ([`crate::core::pixi_compat`]) into the generic
+/// ones. Both see a pixi project's PyPI dependencies, so both report an
+/// environment Python those dependencies exclude, and dependencies with no
+/// common Python. Where they describe the same problem the pixi wording,
+/// which names the `pixi add python=…` that fixes it, takes the generic
+/// finding's place, and the generic fix stays so the editor still offers to
+/// move the project. Every other pixi finding is added as is.
+pub fn merge_pixi_findings(findings: &mut Vec<Finding>, pixi: Vec<Finding>) {
+    for p in pixi {
+        match findings.iter_mut().find(|g| same_problem(g, &p)) {
+            Some(g) => {
+                g.title = p.title;
+                g.detail = p.detail;
+                if p.fix != FixKind::Manual {
+                    g.fix = p.fix;
+                }
+            }
+            None => findings.push(p),
+        }
+    }
+}
+
+/// Do a generic finding and a pixi one report the same problem?
+fn same_problem(generic: &Finding, pixi: &Finding) -> bool {
+    if generic.title == CONFLICT_TITLE {
+        return pixi.title == crate::core::pixi_compat::CONFLICT_TITLE;
+    }
+    generic
+        .title
+        .strip_prefix("Python ")
+        .and_then(|rest| rest.strip_suffix(UNSUPPORTED_SUFFIX))
+        .is_some_and(|py| crate::core::pixi_compat::is_mismatch_title(&pixi.title, py))
 }
 
 /// Run `uv pip install --dry-run` for `target` against the project's declared
@@ -327,7 +368,7 @@ pub fn synthesize(
             });
         findings.push(Finding {
             severity: Severity::Error,
-            title: "Dependencies conflict on Python version".to_string(),
+            title: CONFLICT_TITLE.to_string(),
             detail,
             fix: FixKind::Manual,
         });
@@ -361,7 +402,7 @@ pub fn synthesize(
             why.push_str(&wheel_gap_note(compat, current, target, env.toolchain));
             findings.push(Finding {
                 severity: Severity::Error,
-                title: format!("Python {current} is not supported by this project"),
+                title: format!("Python {current}{UNSUPPORTED_SUFFIX}"),
                 detail: why,
                 fix: target
                     .map(FixKind::RecreateWithPython)
@@ -1056,6 +1097,96 @@ mod tests {
         assert_eq!(
             recommendation(&project, &compat, target).as_deref(),
             Some("none within pixi's `python 3.12.*`: the dependencies support Python 3.9–3.11. Run `pixi add python=3.11` to move the project to Python 3.11")
+        );
+    }
+
+    fn parsed_pixi(python: &str, pypi: &str) -> crate::core::pixi::PixiProject {
+        crate::core::pixi::parse_manifest(
+            &format!(
+                "[workspace]\nname = \"p\"\n\n[dependencies]\npython = \"{python}\"\n\n[pypi-dependencies]\n{pypi}\n"
+            ),
+            crate::core::pixi::ManifestFormat::PixiToml,
+            Path::new("/proj"),
+            PathBuf::from("/proj/pixi.toml"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pixi_python_mismatch_is_reported_once_in_pixi_words() {
+        // The pixi environment runs 3.12; tensorflow has wheels up to 3.11.
+        let compat = report(vec![analysis("tensorflow", &[9, 10, 11])]);
+        let env = EnvSummary {
+            has_venv: true,
+            venv_python: Some(PyVersion::py3(12)),
+            ..Default::default()
+        };
+        let project = ProjectDeps {
+            packages: vec![Requirement::any("tensorflow")],
+            ..pinned_pixi_project("3.12.*")
+        };
+        let (_, mut findings) = synthesize(&env, &project, Some(&compat));
+        let pixi = crate::core::pixi_compat::pixi_findings(
+            &parsed_pixi("3.12.*", "tensorflow = \"*\""),
+            Some(PyVersion::py3(12)),
+            &compat,
+        );
+        assert_eq!((findings.len(), pixi.len()), (1, 1));
+        merge_pixi_findings(&mut findings, pixi);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let f = &findings[0];
+        assert_eq!(
+            f.title,
+            "tensorflow does not support Python 3.12 in this pixi environment"
+        );
+        assert!(
+            f.detail.contains("Run `pixi add python=3.11`"),
+            "{}",
+            f.detail
+        );
+        assert!(!f.detail.contains("Recreate"));
+        // The editor's rebuild action survives the rewording.
+        assert_eq!(f.fix, FixKind::RecreateWithPython(PyVersion::py3(11)));
+    }
+
+    #[test]
+    fn pixi_dependency_conflict_is_reported_once_in_pixi_words() {
+        let compat = report(vec![
+            analysis("legacy", &[8, 9, 10]),
+            analysis("shiny", &[11, 12]),
+        ]);
+        assert!(compat.intersection.is_empty());
+        let (_, mut findings) = synthesize(&EnvSummary::default(), &pixi_project(), Some(&compat));
+        let pixi = crate::core::pixi_compat::pixi_findings(
+            &parsed_pixi("3.12.*", "legacy = \"*\"\nshiny = \"*\""),
+            None,
+            &compat,
+        );
+        merge_pixi_findings(&mut findings, pixi);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].title, crate::core::pixi_compat::CONFLICT_TITLE);
+    }
+
+    #[test]
+    fn unrelated_pixi_findings_are_kept() {
+        // Before `pixi install`: "not installed" and the manifest's mismatch
+        // are two problems, so both stay.
+        let compat = report(vec![analysis("tensorflow", &[9, 10, 11])]);
+        let project = pinned_pixi_project("3.12.*");
+        let (_, mut findings) = synthesize(&EnvSummary::default(), &project, Some(&compat));
+        let pixi = crate::core::pixi_compat::pixi_findings(
+            &parsed_pixi("3.12.*", "tensorflow = \"*\""),
+            None,
+            &compat,
+        );
+        merge_pixi_findings(&mut findings, pixi);
+        let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Pixi environment not installed yet",
+                "tensorflow does not support Python 3.12 in this pixi environment"
+            ]
         );
     }
 
