@@ -1075,8 +1075,11 @@ async fn package_check_markdown(source: &PyPiClient, a: &Assessment, package: &s
     if analysis.sdist_only {
         s.push_str("- No wheel for this platform, so it will compile from source\n");
     }
+    let no_files = analysis.no_files_message(Platform::current().label());
 
     let verdict = match a.probes.venv.as_ref().and_then(|v| v.python) {
+        // No Python helps, so don't suggest one.
+        _ if no_files.is_some() => no_files.unwrap_or_default(),
         Some(current) if analysis.supported.contains(current) => {
             format!("This project's Python {current} can run {}.", analysis.name)
         }

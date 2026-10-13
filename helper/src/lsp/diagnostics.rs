@@ -149,6 +149,13 @@ pub fn to_diagnostic(finding: &Finding) -> Diagnostic {
             FixAction::None,
         ),
 
+        // No install offer and no interpreter switch: neither would help.
+        Problem::NoFilesForPlatform { message } => (
+            DiagnosticSeverity::ERROR,
+            format!("`{}`{provides}: {message}", finding.package),
+            FixAction::None,
+        ),
+
         // Deliberately actionless. Offering to install a name PyPI does not know
         // is how a typo becomes a supply chain incident.
         Problem::NotOnPyPi => (
@@ -545,6 +552,20 @@ mod tests {
             panic!("expected a code action");
         };
         assert!(action.title.contains("opencv-python"));
+    }
+
+    #[test]
+    fn platformless_release_is_an_error_without_a_fix() {
+        let d = to_diagnostic(&finding(
+            Problem::NoFilesForPlatform {
+                message: "tensorflow 2.15.0.post1 publishes no files for Windows x64 (only Linux x64 wheels, no source distribution), so it cannot be installed here.".into(),
+            },
+            "tensorflow",
+            false,
+        ));
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(d.message.contains("publishes no files for Windows x64"));
+        assert!(code_actions(&[d]).is_empty());
     }
 
     #[test]

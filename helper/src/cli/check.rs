@@ -53,6 +53,15 @@ pub async fn run<S: MetadataSource>(
             "none for this platform, will compile from source".yellow()
         );
     }
+    let here = Platform::current().label();
+    let no_files = analysis.no_files_message(here);
+    if no_files.is_some() {
+        println!(
+            "  {:<18}: {}",
+            "files",
+            format!("none for {here}, cannot be installed").red().bold()
+        );
+    }
 
     let env = crate::core::env::project_env(workspace);
     let present = crate::core::env::importable(workspace, env.as_ref()).contains(&analysis.name);
@@ -73,6 +82,14 @@ pub async fn run<S: MetadataSource>(
             .cyan()
     );
     match probes.venv.as_ref().and_then(|v| v.python) {
+        // No Python helps, so don't suggest one.
+        _ if no_files.is_some() => {
+            println!(
+                "  {} {}",
+                "[ERROR]".red().bold(),
+                no_files.unwrap_or_default()
+            );
+        }
         Some(current) if analysis.supported.contains(current) => {
             println!(
                 "  {} This project's Python {} can run {}.",

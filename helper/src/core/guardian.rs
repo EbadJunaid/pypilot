@@ -43,6 +43,12 @@ pub enum Problem {
     NoEnvironment { target: Option<PyVersion> },
     /// PyPI has no such project. Usually a typo, sometimes a private index.
     NotOnPyPi,
+    /// The release publishes nothing installable on this platform: wheels for
+    /// other platforms only and no sdist. No interpreter fixes that.
+    NoFilesForPlatform {
+        /// Which platforms it does ship for, and what that means here.
+        message: String,
+    },
     /// The package is installed, but the attribute this file uses is not in it.
     ///
     /// This is the case metadata cannot see. mediapipe 0.10.35 installs on every
@@ -91,6 +97,8 @@ pub struct BufferContext {
     pub installed_count: usize,
     /// Newest interpreter every unsatisfied import in this file agrees on.
     pub file_target: Option<PyVersion>,
+    /// The platform wheels were judged against, for naming it in messages.
+    pub platform: Option<Platform>,
 }
 
 /// The decision table. Pure, so each branch is directly testable.
@@ -104,6 +112,13 @@ pub fn classify(
     let problem = match (analysis, ctx.venv_python) {
         // Nothing on PyPI under that name. Never offer to install it.
         (None, _) => Problem::NotOnPyPi,
+
+        // Neither a venv nor a different Python helps: nothing installs here.
+        (Some(a), _) if a.no_files_for_platform => Problem::NoFilesForPlatform {
+            message: a
+                .no_files_message(ctx.platform.map_or("this platform", |p| p.label()))
+                .unwrap_or_default(),
+        },
 
         // No venv yet: the fix builds one, sized for the whole file.
         (Some(_), None) => Problem::NoEnvironment {
@@ -206,9 +221,12 @@ pub async fn analyze_buffer_in<S: MetadataSource>(
 
     // With no venv, the first environment should suit every import in the file,
     // so intersect them all rather than sizing for whichever one is on screen.
+    // A package with no files here can't be helped by any interpreter, so it
+    // doesn't get a say (it would empty the set for everything else).
     let file_target = analyses
         .values()
         .flatten()
+        .filter(|a| !a.no_files_for_platform)
         .map(|a| a.supported.clone())
         .reduce(|acc, s| acc.intersect(&s))
         .and_then(|set| set.max());
@@ -217,6 +235,7 @@ pub async fn analyze_buffer_in<S: MetadataSource>(
         venv_python,
         installed_count: installed.count(),
         file_target,
+        platform: Some(platform),
     };
 
     let extensions = matrix::cuda_extensions();
@@ -388,6 +407,7 @@ mod tests {
             venv_python: Some(PyVersion::py3(12)),
             installed_count: 3,
             file_target: Some(PyVersion::py3(12)),
+            platform: None,
         };
         let f = classify(
             import_of("mediapipe"),
@@ -406,6 +426,7 @@ mod tests {
             venv_python: Some(PyVersion::py3(13)),
             installed_count: 3,
             file_target: Some(PyVersion::py3(12)),
+            platform: None,
         };
         let f = classify(
             import_of("mediapipe"),
@@ -436,6 +457,7 @@ mod tests {
             venv_python: None,
             installed_count: 0,
             file_target: Some(PyVersion::py3(12)),
+            platform: None,
         };
         let f = classify(
             import_of("mediapipe"),
@@ -516,5 +538,40 @@ mod tests {
         };
         let f = classify(import_of("mediapip"), "mediapip".into(), false, None, &ctx);
         assert_eq!(f.problem, Problem::NotOnPyPi);
+    }
+
+    #[test]
+    fn release_without_files_here_is_neither_an_install_nor_a_python_switch() {
+        let mut a = analysis("tensorflow", &[]);
+        a.version = "2.15.0.post1".into();
+        a.has_platform_wheels = false;
+        a.has_foreign_wheels = true;
+        a.no_files_for_platform = true;
+        a.wheel_platforms = vec!["Linux x64".into()];
+        let platform = Platform {
+            os: crate::core::platform::Os::Windows,
+            arch: crate::core::platform::Arch::X86_64,
+        };
+        for venv_python in [None, Some(PyVersion::py3(11))] {
+            let ctx = BufferContext {
+                venv_python,
+                installed_count: 0,
+                file_target: None,
+                platform: Some(platform),
+            };
+            let f = classify(
+                import_of("tensorflow"),
+                "tensorflow".into(),
+                false,
+                Some(&a),
+                &ctx,
+            );
+            let Problem::NoFilesForPlatform { message } = f.problem else {
+                panic!("expected NoFilesForPlatform, got {:?}", f.problem);
+            };
+            assert!(message.starts_with(
+                "tensorflow 2.15.0.post1 publishes no files for Windows x64 (only Linux x64 wheels"
+            ));
+        }
     }
 }
