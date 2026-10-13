@@ -295,8 +295,29 @@ pub fn synthesize(
         }
     }
 
+    // Releases with wheels for other platforms only and no sdist: no Python
+    // version helps, so say what is actually wrong rather than reporting a
+    // version conflict.
+    let here = compat.platform.label();
+    for p in compat.uninstallable() {
+        let mut detail = p.no_files_message(here).unwrap_or_default();
+        detail.push_str(&format!(
+            " Pin a release of {} that publishes files for {here}.",
+            p.name
+        ));
+        findings.push(Finding {
+            severity: Severity::Error,
+            title: format!("{} {} cannot be installed on {here}", p.name, p.version),
+            detail,
+            fix: FixKind::Manual,
+        });
+    }
+
     // Empty intersection → hard conflict; can't be auto-fixed by choosing a version.
     if compat.intersection.is_empty() {
+        if compat.conflicts.is_empty() && compat.uninstallable().next().is_some() {
+            return (None, findings);
+        }
         let detail = compat
             .conflicts
             .first()
@@ -999,5 +1020,52 @@ mod tests {
         let (target, findings) = synthesize(&EnvSummary::default(), &ProjectDeps::default(), None);
         assert!(target.is_none());
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn release_without_files_here_is_named_not_called_a_conflict() {
+        let mut tf = analysis("tensorflow", &[]);
+        tf.version = "2.15.0.post1".into();
+        tf.has_platform_wheels = false;
+        tf.has_foreign_wheels = true;
+        tf.no_files_for_platform = true;
+        tf.wheel_platforms = vec!["Linux x64".into()];
+        let compat = report_on(Os::Windows, vec![tf, analysis("numpy", &[10, 11, 12])]);
+        let (target, findings) = synthesize(&compat_venv(11), &python_project(), Some(&compat));
+
+        assert_eq!(target, None);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let f = &findings[0];
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(
+            f.title,
+            "tensorflow 2.15.0.post1 cannot be installed on Windows x64"
+        );
+        assert!(f.detail.starts_with(
+            "tensorflow 2.15.0.post1 publishes no files for Windows x64 (only Linux x64 wheels"
+        ));
+        assert!(!findings.iter().any(|f| f.title.contains("conflict")));
+    }
+
+    #[test]
+    fn real_conflict_is_still_reported_beside_a_platformless_release() {
+        let mut gone = analysis("winonly", &[]);
+        gone.no_files_for_platform = true;
+        let mut compat = report(vec![
+            gone,
+            analysis("legacy", &[8, 9, 10]),
+            analysis("shiny", &[11, 12]),
+        ]);
+        compat.conflicts = vec![pypi::ConflictPair {
+            low: analysis("legacy", &[8, 9, 10]),
+            high: analysis("shiny", &[11, 12]),
+            explanation:
+                "legacy supports up to Python 3.10 but shiny requires at least Python 3.11".into(),
+        }];
+        let (_, findings) = synthesize(&compat_venv(11), &python_project(), Some(&compat));
+        assert!(findings.iter().any(|f| f.title.starts_with("winonly")));
+        assert!(findings
+            .iter()
+            .any(|f| f.title == "Dependencies conflict on Python version"));
     }
 }
