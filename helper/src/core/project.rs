@@ -54,11 +54,23 @@ pub struct ProjectDeps {
     pub has_conda_env: bool,
     /// Python pin parsed from a conda `environment.yml`, if any.
     pub conda_python: Option<String>,
+    /// The pixi manifest, when this is a pixi project (see
+    /// [`crate::core::pixi::detect`]). pixi owns such a project: PyPilot
+    /// must manage it through pixi, never through uv or pip.
+    pub pixi_manifest: Option<PathBuf>,
+    /// The pixi default environment's conda dependencies (`python`
+    /// excluded). Kept apart from [`ProjectDeps::packages`]: conda names are
+    /// not PyPI names, so they never go to the PyPI compatibility engine.
+    pub conda_deps: Vec<crate::core::pixi::CondaDep>,
 }
 
 impl ProjectDeps {
     pub fn is_python_project(&self) -> bool {
         !self.sources.is_empty()
+    }
+
+    pub fn is_pixi(&self) -> bool {
+        self.pixi_manifest.is_some()
     }
 
     /// Just the names, for display and for callers that don't care about pins.
@@ -99,6 +111,26 @@ pub fn scan(workspace: &Path) -> ProjectDeps {
         }
         deps.has_conda_env = true;
         deps.sources.push(env_yml);
+    }
+
+    // A pixi project is a Python project: its PyPI dependencies are checked
+    // like any other, and its conda ones are recorded but kept off PyPI.
+    // pixi's python spec is what decides the interpreter, so it outranks a
+    // pyproject's `requires-python`.
+    if let Some(pixi) = crate::core::pixi::detect(workspace) {
+        names.extend(pixi.pypi_deps.iter().cloned());
+        if let Some(rp) = pixi
+            .python
+            .as_deref()
+            .and_then(crate::core::pixi::python_spec_pep440)
+        {
+            deps.declared_requires_python = Some(rp);
+        }
+        deps.conda_deps = pixi.conda_deps.clone();
+        if !deps.sources.contains(&pixi.manifest) {
+            deps.sources.push(pixi.manifest.clone());
+        }
+        deps.pixi_manifest = Some(pixi.manifest);
     }
 
     // A bare `.py` file also makes this a Python project even with no manifest,
@@ -470,6 +502,7 @@ const NOTEBOOK_SEARCH_DEPTH: usize = 4;
 /// build output, and Jupyter's own autosave copies.
 const NOTEBOOK_SKIP_DIRS: &[&str] = &[
     ".venv",
+    ".pixi",
     "venv",
     "env",
     ".git",
@@ -517,9 +550,9 @@ pub fn has_notebooks(workspace: &Path) -> bool {
 }
 
 /// Manifests that mark a directory as the root of a Python project, the place
-/// its `.venv` belongs. `environment.yml` counts at the workspace root, where
+/// its environment belongs. `environment.yml` counts at the workspace root, where
 /// [`scan`] reads it, but is too common in non-Python subfolders to count below.
-const PROJECT_MANIFESTS: &[&str] = &["pyproject.toml", "requirements.txt"];
+const PROJECT_MANIFESTS: &[&str] = &["pyproject.toml", "requirements.txt", "pixi.toml"];
 
 /// How deep [`project_root`] looks for a nested project when the workspace root
 /// has none: `backend/` and `services/api/` are covered, deeper layouts are rare
@@ -858,6 +891,7 @@ requests = "^2.31"
             declared_requires_python: None,
             has_conda_env: true,
             conda_python: Some("3.10".to_string()),
+            ..Default::default()
         };
         let toml = conda_migration_pyproject(&deps, "My Demo Project");
 
@@ -897,6 +931,81 @@ requests = "^2.31"
         assert!(deps.is_python_project());
         assert!(deps.packages.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pixi_toml_alone_is_a_python_project() {
+        let dir = fresh_dir("pypilot-scan-pixi-toml");
+        std::fs::write(
+            dir.join("pixi.toml"),
+            include_str!("../../tests/fixtures/pixi/pixi-0.81-init.pixi.toml"),
+        )
+        .unwrap();
+        let deps = scan(&dir);
+        assert!(deps.is_python_project());
+        assert!(deps.is_pixi());
+        assert_eq!(deps.pixi_manifest, Some(dir.join("pixi.toml")));
+        assert_eq!(deps.sources, [dir.join("pixi.toml")]);
+        // PyPI deps go to the compatibility engine, conda deps do not.
+        assert_eq!(deps.packages, [req("requests", ">=2.34.2,<3")]);
+        assert_eq!(deps.conda_deps.len(), 1);
+        assert_eq!(deps.conda_deps[0].name, "numpy");
+        assert_eq!(deps.declared_requires_python.as_deref(), Some("==3.12.*"));
+    }
+
+    #[test]
+    fn a_pixi_pyproject_merges_both_dependency_lists() {
+        let dir = fresh_dir("pypilot-scan-pixi-pyproject");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]
+name = \"x\"
+requires-python = \">=3.10\"
+dependencies = [\"requests>=2\"]
+
+[tool.pixi.workspace]
+platforms = [\"win-64\"]
+
+[tool.pixi.dependencies]
+python = \"3.11.*\"
+numpy = \"*\"
+
+[tool.pixi.pypi-dependencies]
+rich = \">=13\"
+",
+        )
+        .unwrap();
+        let deps = scan(&dir);
+        assert!(deps.is_pixi());
+        assert_eq!(deps.sources, [dir.join("pyproject.toml")]);
+        assert_eq!(deps.packages, [req("requests", ">=2"), req("rich", ">=13")]);
+        assert_eq!(deps.conda_deps[0].name, "numpy");
+        // pixi's python pin decides the interpreter.
+        assert_eq!(deps.declared_requires_python.as_deref(), Some("==3.11.*"));
+
+        // A plain pyproject is not pixi.
+        let plain = fresh_dir("pypilot-scan-plain-pyproject");
+        std::fs::write(
+            plain.join("pyproject.toml"),
+            "[project]
+name = \"x\"
+",
+        )
+        .unwrap();
+        assert!(!scan(&plain).is_pixi());
+    }
+
+    #[test]
+    fn pixi_manifests_mark_project_roots_and_envs_are_skipped() {
+        let ws = fresh_dir("pypilot-root-pixi");
+        touch(&ws.join("README.md"));
+        touch(&ws.join("analysis").join("pixi.toml"));
+        assert_eq!(project_root(&ws), ws.join("analysis"));
+
+        // A notebook inside a pixi prefix is not the user's.
+        let ws = fresh_dir("pypilot-notebook-pixi-env");
+        touch(&ws.join(".pixi/envs/default/share/jupyter/demo.ipynb"));
+        assert!(!has_notebooks(&ws));
     }
 
     /// A fresh, empty directory under the temp dir for one test.

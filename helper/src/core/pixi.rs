@@ -383,6 +383,24 @@ fn alternative_max_minor(spec: &str) -> Option<PyVersion> {
         .map(PyVersion::py3)
 }
 
+/// A conda python spec as a PEP 440 specifier (`3.12.*` -> `==3.12.*`,
+/// `>=3.10,<3.13` unchanged), for showing next to a pyproject's
+/// `requires-python`. `None` for `*`, alternatives (`|`) and build strings,
+/// which PEP 440 cannot express.
+pub fn python_spec_pep440(spec: &str) -> Option<String> {
+    let version = join_version_spaces(spec);
+    if version.is_empty() || version == "*" || version.contains(['|', ' ']) {
+        return None;
+    }
+    let clauses: Vec<String> = version
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(conda_clause_to_pep440)
+        .collect();
+    (!clauses.is_empty()).then(|| clauses.join(","))
+}
+
 /// Drop whitespace that sits after an operator or around a comma, so only the
 /// gap before a build string remains.
 fn join_version_spaces(spec: &str) -> String {
@@ -1004,6 +1022,20 @@ platforms = ["win-64", { platform = "linux-64", cuda = "12.0" }]
         )
         .unwrap();
         assert_eq!(p.cuda.as_deref(), Some("11"));
+    }
+
+    #[test]
+    fn python_spec_as_pep440() {
+        assert_eq!(python_spec_pep440("3.12.*").as_deref(), Some("==3.12.*"));
+        assert_eq!(python_spec_pep440("3.12").as_deref(), Some("==3.12.*"));
+        assert_eq!(
+            python_spec_pep440(">=3.10, <3.13").as_deref(),
+            Some(">=3.10,<3.13")
+        );
+        assert_eq!(python_spec_pep440("==3.11.9").as_deref(), Some("==3.11.9"));
+        for none in ["*", "", "3.10.*|3.11.*", "3.12.* *_cpython"] {
+            assert_eq!(python_spec_pep440(none), None, "{none:?}");
+        }
     }
 
     #[test]
