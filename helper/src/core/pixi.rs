@@ -10,8 +10,14 @@
 //! Everything here is read off disk and side-effect free, except the two
 //! fallbacks that ask the `pixi` binary itself ([`info_envs`], [`pixi_version`]).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use serde::Deserialize;
+
+use crate::core::command;
+use crate::core::installed;
 use crate::core::project::{self, normalize_name, Requirement};
 use crate::pypi::pyversion::{Clause, PyVersion};
 
@@ -76,6 +82,16 @@ pub struct PixiProject {
     pub cuda: Option<String>,
     /// Non-default features, in name order.
     pub features: Vec<PixiFeature>,
+}
+
+/// An installed pixi environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PixiEnv {
+    pub name: String,
+    pub prefix: PathBuf,
+    pub python_exe: PathBuf,
+    /// From `conda-meta/python-X.Y.Z-<build>.json`, when Python is installed.
+    pub python_version: Option<PyVersion>,
 }
 
 /// Find the pixi project rooted at `workspace`.
@@ -403,6 +419,211 @@ fn conda_clause_to_pep440(clause: &str) -> String {
     } else {
         format!("=={version}.*")
     }
+}
+
+/// The installed environment `name` of a project, if its prefix exists under
+/// `<root>/.pixi/envs/`. Detached environments live elsewhere; find those with
+/// [`info_envs`] and build them with [`env_at`].
+pub fn env(project: &PixiProject, name: &str) -> Option<PixiEnv> {
+    let prefix = project.root.join(".pixi").join("envs").join(name);
+    prefix.is_dir().then(|| env_at(name, &prefix))
+}
+
+/// Describe the environment at `prefix`, wherever it lives.
+pub fn env_at(name: &str, prefix: &Path) -> PixiEnv {
+    PixiEnv {
+        name: name.to_string(),
+        prefix: prefix.to_path_buf(),
+        python_exe: interpreter_path(prefix),
+        python_version: python_version_from_conda_meta(prefix),
+    }
+}
+
+/// The interpreter of a conda prefix on this OS.
+pub fn interpreter_path(prefix: &Path) -> PathBuf {
+    interpreter_path_for(prefix, cfg!(windows))
+}
+
+fn interpreter_path_for(prefix: &Path, windows: bool) -> PathBuf {
+    if windows {
+        prefix.join("python.exe")
+    } else {
+        prefix.join("bin").join("python")
+    }
+}
+
+/// The Python minor installed in a conda prefix, read from the
+/// `conda-meta/python-X.Y.Z-<build>.json` record conda writes per package.
+pub fn python_version_from_conda_meta(prefix: &Path) -> Option<PyVersion> {
+    let entries = std::fs::read_dir(prefix.join("conda-meta")).ok()?;
+    entries
+        .flatten()
+        .filter_map(|e| conda_meta_python(&e.file_name().to_string_lossy()))
+        .max()
+}
+
+/// `python-3.12.7-h1234_0.json` -> 3.12. Other packages whose names start with
+/// `python` (`python-dateutil-...`, `python_abi-...`) are rejected because the
+/// field after `python-` is not a version.
+fn conda_meta_python(file: &str) -> Option<PyVersion> {
+    let rest = file.strip_suffix(".json")?.strip_prefix("python-")?;
+    let version = rest.split('-').next()?;
+    if !version.starts_with(|c: char| c.is_ascii_digit()) || !version.contains('.') {
+        return None;
+    }
+    PyVersion::parse(version)
+}
+
+/// `site-packages` directories of a conda prefix: `Lib/site-packages` on
+/// Windows, `lib/pythonX.Y/site-packages` elsewhere. Same layout as a venv.
+pub fn site_packages_dirs(prefix: &Path) -> Vec<PathBuf> {
+    installed::site_packages_dirs(prefix)
+}
+
+/// The `conda-meta/pixi` record pixi writes into every environment it
+/// installs: which manifest and environment the prefix was built for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EnvMarker {
+    pub manifest_path: PathBuf,
+    pub environment_name: String,
+    #[serde(default)]
+    pub pixi_version: Option<String>,
+}
+
+/// Read a prefix's [`EnvMarker`]. `None` for prefixes pixi did not install
+/// (or installed with a release that predates the record).
+pub fn env_marker(prefix: &Path) -> Option<EnvMarker> {
+    parse_env_marker(&std::fs::read_to_string(prefix.join("conda-meta").join("pixi")).ok()?)
+}
+
+/// Parse the JSON of a `conda-meta/pixi` record.
+pub fn parse_env_marker(text: &str) -> Option<EnvMarker> {
+    serde_json::from_str(text).ok()
+}
+
+/// Which installer put a distribution into a pixi environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistOrigin {
+    /// A conda package. conda-forge Python packages carry a `.dist-info` too,
+    /// with `conda` in its `INSTALLER` file.
+    Conda,
+    /// Installed from PyPI by pixi's uv (`INSTALLER` is `uv-pixi`) or any
+    /// other Python installer.
+    Pypi,
+    /// No `INSTALLER` file to tell.
+    Unknown,
+}
+
+/// Every distribution in a prefix's `site-packages`, normalized per PEP 503,
+/// with the installer that put it there.
+pub fn dist_origins(prefix: &Path) -> BTreeMap<String, DistOrigin> {
+    let mut out = BTreeMap::new();
+    for dir in site_packages_dirs(prefix) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            let Some(name) = installed::distribution_name(&file.to_string_lossy()) else {
+                continue;
+            };
+            out.insert(name, dist_origin(&entry.path()));
+        }
+    }
+    out
+}
+
+/// Classify one `.dist-info` directory by its `INSTALLER` file.
+pub fn dist_origin(dist_info: &Path) -> DistOrigin {
+    match std::fs::read_to_string(dist_info.join("INSTALLER")) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("conda") => DistOrigin::Conda,
+        Ok(text) if !text.trim().is_empty() => DistOrigin::Pypi,
+        _ => DistOrigin::Unknown,
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct InfoJson {
+    #[serde(default)]
+    environments_info: Vec<InfoEnv>,
+}
+
+#[derive(Deserialize)]
+struct InfoEnv {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    prefix: Option<PathBuf>,
+}
+
+/// `(name, prefix)` for every environment in `pixi info --json` output.
+/// Malformed input, or entries without a name or prefix, are skipped.
+pub fn parse_info_json(text: &str) -> Vec<(String, PathBuf)> {
+    let info: InfoJson = serde_json::from_str(text).unwrap_or_default();
+    info.environments_info
+        .into_iter()
+        .filter_map(|e| {
+            let prefix = e.prefix.filter(|p| !p.as_os_str().is_empty())?;
+            (!e.name.is_empty()).then_some((e.name, prefix))
+        })
+        .collect()
+}
+
+/// How long `pixi info` may take before we give up on it.
+const INFO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ask pixi where a project's environments live. A fallback for detached
+/// environments: the default layout is read straight off disk by [`env`].
+/// Empty when pixi is missing, slow or fails.
+pub async fn info_envs(root: &Path) -> Vec<(String, PathBuf)> {
+    let Some((pixi, _)) = find_pixi().await else {
+        return Vec::new();
+    };
+    let root_arg = root.to_string_lossy().into_owned();
+    let args = ["info", "--json", "--manifest-path", root_arg.as_str()];
+    match command::run_with_timeout(&pixi, &args, Some(root), INFO_TIMEOUT).await {
+        Ok(out) if out.success() => parse_info_json(&out.stdout),
+        _ => Vec::new(),
+    }
+}
+
+/// The installed pixi version (`0.40.3`), if pixi can be found.
+pub async fn pixi_version() -> Option<String> {
+    find_pixi().await.map(|(_, version)| version)
+}
+
+/// Locate a working pixi: PATH first, then `$PIXI_HOME/bin` and
+/// `~/.pixi/bin`, where the official installer puts it (an editor started
+/// before the install may not have it on PATH yet).
+async fn find_pixi() -> Option<(PathBuf, String)> {
+    if let Some(v) = command::probe_version("pixi", &["--version"]).await {
+        return Some((PathBuf::from("pixi"), clean_version(&v)));
+    }
+    let bin = if cfg!(windows) { "pixi.exe" } else { "pixi" };
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("PIXI_HOME") {
+        candidates.push(PathBuf::from(home).join("bin").join(bin));
+    }
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.home_dir().join(".pixi").join("bin").join(bin));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            if let Some(v) = command::probe_version(&candidate, &["--version"]).await {
+                return Some((candidate, clean_version(&v)));
+            }
+        }
+    }
+    None
+}
+
+/// `pixi 0.40.3` -> `0.40.3`.
+fn clean_version(line: &str) -> String {
+    line.trim()
+        .strip_prefix("pixi")
+        .map(str::trim)
+        .unwrap_or(line.trim())
+        .to_string()
 }
 
 #[cfg(test)]
@@ -770,5 +991,194 @@ platforms = ["win-64", { platform = "linux-64", cuda = "12.0" }]
         assert_eq!(p.skipped_pypi_deps, 1);
         assert!(p.conda_deps.is_empty());
         assert_eq!(python_spec_minor(">= 3.11"), None);
+    }
+
+    #[test]
+    fn interpreter_path_per_os() {
+        let prefix = Path::new("proj").join(".pixi").join("envs").join("default");
+        assert_eq!(
+            interpreter_path_for(&prefix, true),
+            prefix.join("python.exe")
+        );
+        assert_eq!(
+            interpreter_path_for(&prefix, false),
+            prefix.join("bin").join("python")
+        );
+    }
+
+    fn fake_project(root: &Path) -> PixiProject {
+        std::fs::write(root.join("pixi.toml"), "[workspace]\nplatforms = []\n").unwrap();
+        detect(root).unwrap()
+    }
+
+    fn write_meta(prefix: &Path) {
+        let meta = prefix.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        for f in [
+            "python-3.12.7-h1234_0.json",
+            "python-dateutil-2.9.0-pyhd8ed1ab_0.json",
+            "python_abi-3.12-9_cp312.json",
+            "libpython-3.13.1-hcc31f7b_1_cpython.json",
+            "pixi_env_prefix",
+            "pip-24.2-pyh8b19718_1.json",
+            "history",
+        ] {
+            std::fs::write(meta.join(f), "{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_env_layout() {
+        let root = scratch("env-windows");
+        let project = fake_project(&root);
+        assert!(env(&project, "default").is_none());
+
+        let prefix = root.join(".pixi").join("envs").join("default");
+        let sp = prefix.join("Lib").join("site-packages");
+        std::fs::create_dir_all(&sp).unwrap();
+        std::fs::write(prefix.join("python.exe"), "").unwrap();
+        write_meta(&prefix);
+
+        let e = env(&project, "default").unwrap();
+        assert_eq!(e.name, "default");
+        assert_eq!(e.prefix, prefix);
+        assert_eq!(e.python_exe, interpreter_path(&prefix));
+        assert_eq!(e.python_version, Some(PyVersion::py3(12)));
+        assert_eq!(site_packages_dirs(&prefix), [sp]);
+        assert!(env(&project, "test").is_none());
+    }
+
+    #[test]
+    fn posix_env_layout() {
+        let root = scratch("env-posix");
+        let project = fake_project(&root);
+        let prefix = root.join(".pixi").join("envs").join("test");
+        let sp = prefix.join("lib").join("python3.12").join("site-packages");
+        std::fs::create_dir_all(&sp).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("bin").join("python"), "").unwrap();
+        write_meta(&prefix);
+
+        let e = env(&project, "test").unwrap();
+        assert_eq!(e.python_version, Some(PyVersion::py3(12)));
+        assert_eq!(site_packages_dirs(&prefix), [sp]);
+    }
+
+    #[test]
+    fn conda_meta_without_python() {
+        let root = scratch("no-python");
+        std::fs::create_dir_all(root.join("conda-meta")).unwrap();
+        std::fs::write(
+            root.join("conda-meta").join("numpy-2.1.0-py312_0.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(python_version_from_conda_meta(&root), None);
+        assert_eq!(python_version_from_conda_meta(&root.join("missing")), None);
+        assert_eq!(
+            conda_meta_python("python-3.9.18-h1_0_cpython.json"),
+            Some(PyVersion::py3(9))
+        );
+        assert_eq!(conda_meta_python("python-3.12.7-h1234_0.txt"), None);
+    }
+
+    #[test]
+    fn info_json_parsing() {
+        let text = r#"{
+  "platform": "win-64",
+  "virtual_packages": ["__win=0=0"],
+  "version": "0.40.3",
+  "project_info": { "name": "demo", "manifest_path": "C:\\demo\\pixi.toml" },
+  "environments_info": [
+    { "name": "default", "features": ["default"], "prefix": "C:\\demo\\.pixi\\envs\\default", "dependencies": ["python"] },
+    { "name": "gpu", "prefix": "/elsewhere/envs/demo-gpu" },
+    { "name": "", "prefix": "/nameless" },
+    { "name": "noprefix" }
+  ]
+}"#;
+        assert_eq!(
+            parse_info_json(text),
+            [
+                (
+                    "default".to_string(),
+                    PathBuf::from("C:\\demo\\.pixi\\envs\\default")
+                ),
+                ("gpu".to_string(), PathBuf::from("/elsewhere/envs/demo-gpu")),
+            ]
+        );
+        assert!(parse_info_json("not json").is_empty());
+        assert!(parse_info_json("{}").is_empty());
+        assert!(parse_info_json(r#"{"environments_info": null}"#).is_empty());
+    }
+
+    #[test]
+    fn version_line_is_cleaned() {
+        assert_eq!(clean_version("pixi 0.40.3\n"), "0.40.3");
+        assert_eq!(clean_version("0.40.3"), "0.40.3");
+    }
+
+    /// `pixi info --json` from pixi 0.81.0, home directory redacted.
+    #[test]
+    fn real_info_json() {
+        let text = include_str!("../../tests/fixtures/pixi/pixi-0.81-info.json");
+        assert_eq!(
+            parse_info_json(text),
+            [(
+                "default".to_string(),
+                PathBuf::from(
+                    "<HOME>\\AppData\\Local\\Temp\\pixi-portable\\projA\\.pixi\\envs\\default"
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn env_marker_names_the_project() {
+        let text = r#"{
+  "manifest_path": "C:\\work\\projA\\pixi.toml",
+  "environment_name": "default",
+  "pixi_version": "0.81.0",
+  "environment_lock_file_hash": "697b9a994ccfa7c9",
+  "resolved_platform": { "subdir": "win-64", "virtual_packages": ["__win=10.0"] }
+}"#;
+        let root = scratch("marker");
+        std::fs::create_dir_all(root.join("conda-meta")).unwrap();
+        assert_eq!(env_marker(&root), None);
+        std::fs::write(root.join("conda-meta").join("pixi"), text).unwrap();
+        assert_eq!(
+            env_marker(&root),
+            Some(EnvMarker {
+                manifest_path: PathBuf::from("C:\\work\\projA\\pixi.toml"),
+                environment_name: "default".into(),
+                pixi_version: Some("0.81.0".into()),
+            })
+        );
+        assert_eq!(parse_env_marker("{}"), None);
+        assert_eq!(parse_env_marker("garbage"), None);
+    }
+
+    #[test]
+    fn dist_origin_from_installer_file() {
+        let prefix = scratch("origins");
+        let sp = prefix.join("Lib").join("site-packages");
+        for (dist, installer) in [
+            ("numpy-2.5.4.dist-info", Some("conda\n")),
+            ("charset_normalizer-3.5.2.dist-info", Some("uv-pixi\n")),
+            ("projb-0.1.0.dist-info", Some("uv")),
+            ("mystery-1.0.dist-info", None),
+        ] {
+            std::fs::create_dir_all(sp.join(dist)).unwrap();
+            if let Some(text) = installer {
+                std::fs::write(sp.join(dist).join("INSTALLER"), text).unwrap();
+            }
+        }
+        std::fs::create_dir_all(sp.join("numpy")).unwrap();
+        let origins = dist_origins(&prefix);
+        assert_eq!(origins.len(), 4);
+        assert_eq!(origins["numpy"], DistOrigin::Conda);
+        assert_eq!(origins["charset-normalizer"], DistOrigin::Pypi);
+        assert_eq!(origins["projb"], DistOrigin::Pypi);
+        assert_eq!(origins["mystery"], DistOrigin::Unknown);
+        assert!(dist_origins(&prefix.join("missing")).is_empty());
     }
 }

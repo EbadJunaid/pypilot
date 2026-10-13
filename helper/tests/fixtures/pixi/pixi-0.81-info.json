@@ -1,0 +1,71 @@
+{
+  "platform": "win-64",
+  "virtual_packages": [
+    "__win=10.0.26100=0",
+    "__cuda=13.2=0",
+    "__cuda_arch=8.6=0",
+    "__archspec=1=icelake"
+  ],
+  "version": "0.81.0",
+  "tls_backend": "rustls",
+  "cache_dir": "<HOME>/AppData/Local/Temp/pixi-portable/cache/pixi",
+  "cache_size": null,
+  "auth_dir": "<HOME>\\.rattler\\credentials.json",
+  "global_info": {
+    "bin_dir": "<HOME>/AppData/Local/Temp/pixi-portable/home\\bin",
+    "env_dir": "<HOME>/AppData/Local/Temp/pixi-portable/home\\envs",
+    "manifest": "<HOME>/AppData/Local/Temp/pixi-portable/home\\manifests\\pixi-global.toml"
+  },
+  "project_info": {
+    "name": "projA",
+    "manifest_path": "<HOME>\\AppData\\Local\\Temp\\pixi-portable\\projA\\pixi.toml",
+    "last_updated": "13-10-2026 21:22:59",
+    "pixi_folder_size": null,
+    "version": "0.1.0"
+  },
+  "environments_info": [
+    {
+      "name": "default",
+      "features": [
+        "default"
+      ],
+      "solve_group": null,
+      "environment_size": null,
+      "dependencies": [
+        "python",
+        "numpy"
+      ],
+      "pypi_dependencies": [
+        "requests"
+      ],
+      "platforms": [
+        {
+          "name": "win-64",
+          "subdir": "win-64",
+          "virtual_packages": []
+        }
+      ],
+      "resolved_platform": {
+        "name": "win-64",
+        "subdir": "win-64",
+        "virtual_packages": [
+          "archspec=x86_64",
+          "windows=10.0"
+        ]
+      },
+      "minimum_supported_platform": {
+        "name": "win-64",
+        "subdir": "win-64",
+        "virtual_packages": [
+          "__win"
+        ]
+      },
+      "tasks": [],
+      "channels": [
+        "conda-forge"
+      ],
+      "prefix": "<HOME>\\AppData\\Local\\Temp\\pixi-portable\\projA\\.pixi\\envs\\default"
+    }
+  ],
+  "config_locations": []
+}
