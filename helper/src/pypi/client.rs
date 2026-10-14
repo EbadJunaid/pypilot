@@ -87,6 +87,9 @@ impl MetadataSource for PyPiClient {
                     return Ok(meta);
                 }
             }
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                anyhow::bail!("`{name}` is not on PyPI; check the spelling");
+            }
             anyhow::bail!("PyPI returned {} for `{name}`", resp.status());
         }
 
@@ -116,6 +119,9 @@ impl MetadataSource for PyPiClient {
             .with_context(|| format!("requesting metadata for `{name}=={version}`"))?;
 
         if !resp.status().is_success() {
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                anyhow::bail!("`{name}` has no release {version} on PyPI");
+            }
             anyhow::bail!("PyPI returned {} for `{name}=={version}`", resp.status());
         }
 
