@@ -371,12 +371,12 @@ async fn run_uv_full(
     };
 
     // Scaffold pyproject.toml when the project has none yet so that subsequent
-    // `uv add` calls have a manifest to write into. We do this before creating
-    // the venv because `uv init` itself emits a sensible initial venv via the
-    // pyproject it creates. Existing pyproject.toml files are never touched.
+    // `uv add` calls have a manifest to write into. Its `requires-python`
+    // follows the Python chosen below, so uv keeps the venv built on it.
+    // Existing pyproject.toml files are never touched.
     let has_pyproject = workspace.join("pyproject.toml").is_file();
     if !has_pyproject {
-        match uv::init(&uv_info, workspace).await {
+        match uv::init(&uv_info, summary.python, workspace).await {
             Ok(out) if out.success() => step_ok(summary, "uv init", "pyproject.toml created"),
             Ok(out) => {
                 // Non-zero but not fatal: the directory may already have a
@@ -421,6 +421,10 @@ async fn run_uv_full(
         }
         if summary.failed() {
             return;
+        }
+        // `uv init` above pinned a new project already.
+        if has_pyproject {
+            pin_python(summary, &uv_info, py, workspace).await;
         }
     }
 
@@ -746,6 +750,24 @@ fn derive_why(assessment: &crate::core::Assessment) -> String {
             }
         }
         _ => "No dependency constraints; using an available interpreter.".to_string(),
+    }
+}
+
+/// Pin a uv project to `py`, the Python its `.venv` was just built on, so
+/// the `uv sync` / `uv add` that follow keep that environment instead of
+/// rebuilding it on an older pin or a global `uv python pin`. A failure is
+/// reported but does not stop the run.
+pub(crate) async fn pin_python(
+    summary: &mut SetupSummary,
+    uv_info: &uv::UvInfo,
+    py: PyVersion,
+    workspace: &Path,
+) {
+    let name = format!("uv python pin {py}");
+    match uv::pin(uv_info, py, workspace).await {
+        Ok(out) if out.success() => step_ok(summary, &name, ".python-version updated"),
+        Ok(out) => soft_fail(summary, &name, out.stderr.trim()),
+        Err(e) => soft_fail(summary, &name, &e.to_string()),
     }
 }
 

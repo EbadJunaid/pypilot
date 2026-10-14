@@ -289,15 +289,59 @@ pub async fn sync(uv: &UvInfo, cwd: &Path) -> crate::Result<Output> {
 /// `uv init` — scaffold a new pyproject.toml in the current directory.
 ///
 /// Only called when no `pyproject.toml` exists yet (fresh project or a project
-/// that was previously requirements.txt-only). `uv init` creates a minimal PEP
-/// 621 pyproject.toml, which lets subsequent `uv add` calls record dependencies
-/// properly rather than operating in a stateless mode.
+/// that was previously requirements.txt-only). It lets subsequent `uv add`
+/// calls record dependencies properly rather than operating in a stateless mode.
 ///
-/// The `--no-workspace` flag prevents uv from trying to attach this project to
-/// a parent workspace that may be present further up the directory tree, which
-/// would be surprising and unwanted here.
-pub async fn init(uv: &UvInfo, cwd: &Path) -> crate::Result<Output> {
-    command::run(&uv.path, &["init", "--no-workspace"], Some(cwd)).await
+/// - `--bare` writes only `pyproject.toml`. A plain `uv init` also adds a git
+///   repository, a README, sample code and a build system to a folder that
+///   already holds the user's project.
+/// - `--python` sets `requires-python` from the interpreter PyPilot chose,
+///   and `--pin-python` writes it to `.python-version`. Without them uv takes
+///   its own default (often the newest Python, or a global `uv python pin`),
+///   and the next `uv add` silently rebuilds `.venv` on that version, undoing
+///   the choice the dependencies needed.
+/// - `--no-workspace` keeps uv from attaching the project to a parent
+///   workspace further up the directory tree.
+///
+/// uv releases older than `--bare` reject it; they get the old invocation.
+pub async fn init(uv: &UvInfo, python: Option<PyVersion>, cwd: &Path) -> crate::Result<Output> {
+    let out = command::run(&uv.path, &init_args(python, true), Some(cwd)).await?;
+    if !out.success() && out.stderr.contains("unexpected argument") {
+        return command::run(&uv.path, &init_args(python, false), Some(cwd)).await;
+    }
+    Ok(out)
+}
+
+/// The argument vector for [`init`], split out so a test can assert on it.
+fn init_args(python: Option<PyVersion>, bare: bool) -> Vec<String> {
+    let mut args = vec!["init".to_string()];
+    if bare {
+        args.push("--bare".to_string());
+    }
+    args.push("--no-workspace".to_string());
+    if let Some(py) = python {
+        // A plain `uv init` pins by default; only the bare form needs asking.
+        if bare {
+            args.push("--pin-python".to_string());
+        }
+        args.push("--python".to_string());
+        args.push(py.to_string());
+    }
+    args
+}
+
+/// `uv python pin <version>`: record the project's Python in `.python-version`.
+///
+/// `uv sync` and `uv add` rebuild `.venv` on whatever Python the project's
+/// pin file, or failing that a global `uv python pin`, asks for. Pinning the
+/// version PyPilot just built the environment on keeps them from replacing it.
+pub async fn pin(uv: &UvInfo, version: PyVersion, cwd: &Path) -> crate::Result<Output> {
+    command::run(
+        &uv.path,
+        &["python", "pin", &version.to_string()],
+        Some(cwd),
+    )
+    .await
 }
 
 /// `uv add <pkgs...>` and migrate any existing `requirements.txt` entries.
@@ -602,6 +646,23 @@ mod tests {
             }),
             "uv-x86_64-pc-windows-msvc.zip"
         );
+    }
+
+    #[test]
+    fn init_is_bare_and_pins_the_chosen_python() {
+        assert_eq!(
+            init_args(Some(PyVersion::py3(12)), true),
+            [
+                "init",
+                "--bare",
+                "--no-workspace",
+                "--pin-python",
+                "--python",
+                "3.12"
+            ]
+        );
+        // Old uv without --bare, and no Python chosen yet.
+        assert_eq!(init_args(None, false), ["init", "--no-workspace"]);
     }
 
     #[tokio::test]

@@ -141,7 +141,10 @@ pub async fn install_packages(
             // if pyproject.toml is already present it exits without touching it.
             let has_pyproject = workspace.join("pyproject.toml").is_file();
             if !has_pyproject {
-                match uv::init(&uv_info, workspace).await {
+                // Pin the new manifest to the environment's Python, or the
+                // `uv add` below rebuilds .venv on uv's default instead.
+                let python = crate::core::env::project_env(workspace).and_then(|e| e.python);
+                match uv::init(&uv_info, python, workspace).await {
                     Ok(out) if out.success() => {
                         push(&mut summary, "uv init", true, "pyproject.toml created");
                     }
@@ -410,6 +413,9 @@ pub async fn recreate_with_python(
             // Restore the declared dependencies, then add the new one.
             let requirements = workspace.join("requirements.txt");
             if workspace.join("pyproject.toml").is_file() {
+                // Without this, `uv sync` follows the project's old pin and
+                // rebuilds .venv on the Python it was just moved away from.
+                setup::pin_python(&mut summary, &uv_info, version, workspace).await;
                 match uv::sync(&uv_info, workspace).await {
                     Ok(out) if out.success() => push(
                         &mut summary,
