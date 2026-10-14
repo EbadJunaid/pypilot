@@ -168,6 +168,23 @@ mod tests {
         assert!(!s.contains(PyVersion::py3(8)));
     }
 
+    /// Python 3.15 is released: pure-Python, abi3 and cp315 wheels must all
+    /// count as supporting it, or every project on 3.15 is told to downgrade.
+    #[test]
+    fn wheels_cover_python_3_15() {
+        for wheel in [
+            "six-1.17.0-py2.py3-none-any.whl",
+            "cryptography-42.0-cp39-abi3-manylinux_2_17_x86_64.whl",
+            "numpy-2.5.4-cp315-cp315-manylinux_2_28_x86_64.whl",
+        ] {
+            let t = WheelTags::parse(wheel).unwrap();
+            assert!(
+                t.supported_on(&linux()).contains(PyVersion::py3(15)),
+                "{wheel} should support Python 3.15"
+            );
+        }
+    }
+
     #[test]
     fn non_wheel_returns_none() {
         assert!(WheelTags::parse("mediapipe-0.10.9.tar.gz").is_none());

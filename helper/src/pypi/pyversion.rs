@@ -19,7 +19,7 @@ use std::fmt;
 /// Lowest CPython minor PyPilot reasons about.
 pub const MIN_MINOR: u8 = 7;
 /// Highest CPython minor PyPilot reasons about. Bump as new CPython ships.
-pub const MAX_MINOR: u8 = 14;
+pub const MAX_MINOR: u8 = 15;
 
 /// A CPython version at minor granularity (major is always 3 in our universe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
