@@ -3,6 +3,22 @@
 All notable changes to PyPilot's engine and Zed extension. Releases and their
 full notes are on the [Releases page](https://github.com/pypilot-dev/pypilot/releases).
 
+## [1.2.1]
+
+- Fixed: the environment stays on the Python PyPilot chose. uv rebuilds `.venv` on
+  whatever `.python-version` (or a global `uv python pin`) asks for, so after setup or
+  "Fix Python" the next `uv add` or `uv sync` could quietly move it to another version
+  while the report said otherwise. New projects get `requires-python` and
+  `.python-version` from the chosen Python, and rebuilding an existing uv project
+  updates its pin.
+- New projects are created with `uv init --bare`: only `pyproject.toml` is written, with
+  no git repository, README, sample code or build system added to your folder.
+- `pypilot check` and the editor's check report accept a requirement such as
+  `mediapipe==0.10.14` or `numpy<2`, and judge the release it selects rather than the
+  newest one.
+- A misspelled package now reads "`x` is not on PyPI; check the spelling" instead of a
+  raw 404.
+
 ## [1.2.0]
 
 - pixi support: pixi projects are detected and managed through pixi (`pixi install`,

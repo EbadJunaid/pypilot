@@ -39,7 +39,8 @@ PyPilot supports both `uv` and standard `pip` for managing virtual environments.
 
 ### Project initialization and uv mode
 When `package_manager = "uv"` (the default):
-- If the project directory lacks a `pyproject.toml`, PyPilot runs `uv init` to create one.
+- If the project directory lacks a `pyproject.toml`, PyPilot runs `uv init --bare` to create one, with `requires-python` and `.python-version` set to the Python it chose. Nothing else is added to the folder.
+- When PyPilot builds `.venv` on a Python version, it pins the project to that version, so a later `uv sync` or `uv add` keeps the environment rather than rebuilding it on an older pin or a global `uv python pin`.
 - If a `requirements.txt` file exists during setup, PyPilot reads its dependencies and runs `uv add` to migrate them directly into the new `pyproject.toml`.
 - Running `pypilot install <package>` invokes `uv add <package>`, adding the dependency to the project manifest and syncing the environment.
 
@@ -105,6 +106,7 @@ The helper binary also runs directly in any shell:
 pypilot doctor            Inspect the environment and print a status report
 pypilot setup             Configure the virtual environment and install dependencies
 pypilot check <package>   Check whether a package runs on the current Python version
+                          (accepts a requirement, e.g. mediapipe==0.10.14)
 pypilot install <pkg>     Install a package and update the project manifest
 pypilot fix python        Rebuild the virtual environment on a compatible Python version
 pypilot fix cuda          Re-pin torch and tensorflow to the system driver build
