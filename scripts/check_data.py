@@ -16,7 +16,9 @@ Checks:
   extensions  xformers / bitsandbytes / flash-attn / mamba-ssm / causal-conv1d:
               wheel platforms and torch pin of the newest release vs
               cuda_extensions.json
-  python      newest CPython the newest torch ships wheels for (informational)
+  python      a released CPython newer than the engine's MAX_MINOR (it would
+              call every package unsupported there); plus the newest CPython
+              the newest torch ships wheels for (informational)
   nvidia      every CUDA version torch builds target needs a driver row in
               nvidia.json; plus a reminder to check NVIDIA's release notes
 
@@ -47,6 +49,8 @@ PYPI_VERSION = "https://pypi.org/pypi/{}/{}/json"
 TORCH_INDEX_ROOT = "https://download.pytorch.org/whl/"
 TORCH_INDEX_PKG = "https://download.pytorch.org/whl/{}/torch/"
 NVIDIA_NOTES = "https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html"
+CPYTHON_RELEASES = "https://endoflife.date/api/python.json"
+PYVERSION_RS = ROOT / "helper" / "src" / "pypi" / "pyversion.rs"
 OLDEST_CUDA_TAG = 118  # Older indexes are frozen; not worth tracking.
 
 OK, STALE, INFO, ERROR = "ok", "stale", "info", "error"
@@ -388,6 +392,23 @@ def check_extensions(ext_table: Dict) -> List[Dict]:
     return out
 
 
+def check_cpython() -> List[Dict]:
+    m = re.search(r"pub const MAX_MINOR: u8 = (\d+);", PYVERSION_RS.read_text(encoding="utf-8"))
+    if not m:
+        return [result("python", STALE, f"MAX_MINOR not found in {PYVERSION_RS.name}")]
+    ceiling = int(m.group(1))
+    released = [int(c["cycle"].split(".")[1]) for c in fetch_json(CPYTHON_RELEASES)
+                if c.get("cycle", "").startswith("3.")]
+    newest = max(released)
+    if newest > ceiling:
+        return [result("python", STALE,
+                       f"CPython 3.{newest} is released but MAX_MINOR in "
+                       f"helper/src/pypi/pyversion.rs is {ceiling}: the engine treats every "
+                       f"package as unsupported on 3.{newest}. Raise it",
+                       newest=f"3.{newest}", max_minor=ceiling)]
+    return [result("python", OK, f"MAX_MINOR covers the newest CPython (3.{newest})")]
+
+
 def check_python(torch_pypi: Dict) -> List[Dict]:
     latest = torch_pypi["info"]["version"]
     tags = set()
@@ -459,6 +480,7 @@ def run_checks() -> List[Dict]:
         guarded("companions", check_companions, fw)
     if ext is not None:
         guarded("extensions", check_extensions, ext)
+    guarded("python", check_cpython)
     if torch_pypi is not None:
         guarded("python", check_python, torch_pypi)
     if nvidia is not None and fw is not None:
