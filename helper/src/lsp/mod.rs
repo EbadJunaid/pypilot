@@ -36,7 +36,7 @@ use crate::core::{
     Severity,
 };
 use crate::pypi::pyversion::PyVersion;
-use crate::pypi::{MetadataSource, PyPiClient};
+use crate::pypi::PyPiClient;
 use crate::settings::{Notifications, PackageManager, ResolvedMode, Settings};
 
 use diagnostics::{Scope, CMD_INSTALL, CMD_RECREATE};
@@ -1058,21 +1058,30 @@ fn details_markdown(a: &Assessment) -> String {
 /// The `pypilot check <package>` answer, as a report section.
 async fn package_check_markdown(source: &PyPiClient, a: &Assessment, package: &str) -> String {
     let mut s = format!("\n## Check: {package}\n");
-    // Accept what a user would type into requirements.txt, e.g. `numpy>=2`.
-    let Some(name) = crate::core::project::requirement_name(package) else {
+    // Accept what a user would type into requirements.txt, e.g. `numpy>=2`,
+    // and judge it on the release that specifier selects.
+    let Some(req) = crate::core::project::parse_requirement(package) else {
         s.push_str(&format!("`{package}` is not a package name.\n"));
         return s;
     };
-    let meta = match source.fetch(&name).await {
+    let meta = match crate::pypi::resolve(source, &req).await {
         Ok(meta) => meta,
         Err(e) => {
-            s.push_str(&format!("PyPI has no usable metadata for `{name}`: {e}\n"));
+            s.push_str(&format!("{e}\n"));
             return s;
         }
     };
 
     let analysis = meta.analyze(&Platform::current());
-    s.push_str(&format!("- Latest release: **{}**\n", analysis.version));
+    if req.is_pinned() {
+        s.push_str(&format!(
+            "- Release matching `{}`: **{}**\n",
+            req.spec.trim(),
+            analysis.version
+        ));
+    } else {
+        s.push_str(&format!("- Latest release: **{}**\n", analysis.version));
+    }
     s.push_str(&format!(
         "- Supported Python: **{}**\n",
         analysis.supported.to_range_string()

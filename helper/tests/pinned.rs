@@ -11,9 +11,9 @@
 use std::path::PathBuf;
 
 use pypilot::core::platform::{Arch, Os, Platform};
-use pypilot::core::project::Requirement;
+use pypilot::core::project::{parse_requirement, Requirement};
 use pypilot::pypi::pyversion::PyVersion;
-use pypilot::pypi::{analyze, FixtureSource};
+use pypilot::pypi::{analyze, resolve, FixtureSource};
 
 fn linux() -> Platform {
     Platform {
@@ -135,4 +135,20 @@ async fn prerelease_is_not_picked_by_a_plain_lower_bound() {
     // 0.11.0rc1 exists in the fixture's release list but must not be chosen.
     let report = analyze(&source(), linux(), &[req("mediapipe", ">=0.10.14")]).await;
     assert_eq!(report.per_package[0].version, "0.10.35");
+}
+
+/// `pypilot check mediapipe==0.10.14` used to send the whole string to PyPI as
+/// a package name. It is now read as a requirement and checked on the release
+/// it pins.
+#[tokio::test]
+async fn check_reads_a_typed_requirement() {
+    let src = source();
+    let pinned = parse_requirement("mediapipe==0.10.14").unwrap();
+    assert_eq!(
+        resolve(&src, &pinned).await.unwrap().info.version,
+        "0.10.14"
+    );
+
+    let plain = parse_requirement("mediapipe").unwrap();
+    assert_eq!(resolve(&src, &plain).await.unwrap().info.version, "0.10.35");
 }

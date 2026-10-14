@@ -85,7 +85,7 @@ impl CompatReport {
 /// which Python versions are usable. Reading the newest release for a pinned
 /// dependency is how you end up recommending an interpreter the pinned version
 /// cannot install on.
-async fn resolve<S: MetadataSource>(
+pub async fn resolve<S: MetadataSource>(
     source: &S,
     req: &Requirement,
 ) -> crate::Result<metadata::PackageMetadata> {

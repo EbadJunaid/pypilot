@@ -1,14 +1,16 @@
 //! `pypilot check <pkg>`: can this package run on the current environment?
 //!
 //! Read-only, and useful before adding a dependency rather than after the
-//! install fails.
+//! install fails. Takes anything a requirements file would: `numpy`,
+//! `mediapipe==0.10.14`, `torch<2.6`. A specifier is judged on the release
+//! it selects, whose wheels can support different Pythons than the newest.
 
 use std::path::Path;
 
 use colored::Colorize;
 
 use crate::core::platform::Platform;
-use crate::core::probe;
+use crate::core::{probe, project};
 use crate::pypi::MetadataSource;
 use crate::settings::Settings;
 
@@ -18,10 +20,10 @@ pub async fn run<S: MetadataSource>(
     source: &S,
     package: &str,
 ) -> crate::Result<()> {
-    let meta = source
-        .fetch(package)
-        .await
-        .map_err(|e| anyhow::anyhow!("PyPI has no usable metadata for `{package}`: {e}"))?;
+    let Some(req) = project::parse_requirement(package) else {
+        anyhow::bail!("`{package}` is not a package name or requirement");
+    };
+    let meta = crate::pypi::resolve(source, &req).await?;
 
     let analysis = meta.analyze(&Platform::current());
     let probes = probe::run(workspace, settings).await;
@@ -38,6 +40,9 @@ pub async fn run<S: MetadataSource>(
             .bold()
             .cyan()
     );
+    if req.is_pinned() {
+        println!("  {:<18}: {}", "requirement", req.to_string().cyan());
+    }
     println!(
         "  {:<18}: {}",
         "supported Python",
