@@ -3,6 +3,13 @@
 All notable changes to PyPilot's engine and Zed extension. Releases and their
 full notes are on the [Releases page](https://github.com/pypilot-dev/pypilot/releases).
 
+## [1.2.2]
+
+- Python 3.15 support. On a 3.15 project every package was reported as unsupported,
+  even pure-Python ones and those shipping `cp315` wheels, and doctor recommended
+  rebuilding on 3.14. 3.15 is now recognised for wheels, `requires-python`,
+  interpreter discovery and recommendations.
+
 ## [1.2.1]
 
 - Fixed: the environment stays on the Python PyPilot chose. uv rebuilds `.venv` on
